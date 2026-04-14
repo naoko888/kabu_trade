@@ -159,13 +159,13 @@ micro_dry_positions  = []   # 全系統のオープンポジション一覧
 micro_dry_day_pnl    = 0
 micro_dry_trade_log  = []
 
-# 系統③ 月次ドローダウン制限
-S3_MONTHLY_DD_LIMIT  = -50_000  # 月次損失制限（円）
-S3_PT_TO_YEN         = 10       # 1pt = ¥10（マイクロ先物）
-S3_COMMISSION_YEN    = 22       # 往復手数料（円）= 2.2pt × ¥10
-s3_monthly_pnl       = 0.0      # 系統③の月間累計損益（円）
-s3_monthly_skip      = False    # 月次制限フラグ（True=今月のエントリーをスキップ）
-s3_current_month     = None     # 現在の年月 (year, month)
+# 系統①③合算 月次ドローダウン制限
+MICRO_MONTHLY_DD_LIMIT  = -30_000  # 月次損失制限（円）
+MICRO_PT_TO_YEN         = 10       # 1pt = ¥10（マイクロ先物）
+MICRO_COMMISSION_YEN    = 22       # 往復手数料（円）= 2.2pt × ¥10
+micro_monthly_pnl       = 0.0      # 系統①③の月間累計損益（円）
+micro_monthly_skip      = False    # 月次制限フラグ（True=今月のエントリーをスキップ）
+micro_current_month     = None     # 現在の年月 (year, month)
 
 # マイクロ先物 インジケーターウォームアップカウンター
 # CSV停止期間があった場合、起動後26本は誤シグナルを防ぐためエントリーをスキップ
@@ -696,9 +696,10 @@ def check_signal(df):
 def add_micro_indicators(df):
     df = df.copy()
 
-    # MA9 / MA10
+    # MA9 / MA10 / MA20
     df["ma9"]  = df["close"].rolling(9).mean()
     df["ma10"] = df["close"].rolling(10).mean()
+    df["ma20"] = df["close"].rolling(20).mean()  # 系統③用
 
     # MACD (12, 26, 9)
     ema_fast        = df["close"].ewm(span=12, adjust=False).mean()
@@ -736,7 +737,7 @@ def check_micro_signal(df):
     row_p2= df.iloc[-3]
 
     # 必須カラムNaNチェック
-    need = ["ma9", "ma10", "macd", "macd_sig", "vol_ratio",
+    need = ["ma9", "ma10", "ma20", "macd", "macd_sig", "vol_ratio",
             "bb_width", "bb_width_ma20"]
     for col in need:
         if pd.isna(row[col]) or pd.isna(row_p[col]) or pd.isna(row_p2[col]):
@@ -766,22 +767,26 @@ def check_micro_signal(df):
     gc       = (row["macd"] > row["macd_sig"])
 
     if above_ma and touch_lo and gc:
-        # 系統②: 火水 × vol>=2.0 × BB拡大中 × 5〜9月除外
-        if wd in (1, 2) and month not in (5, 6, 7, 8, 9):
-            vr  = row["vol_ratio"]
-            bw  = row["bb_width"]
-            bwm = row["bb_width_ma20"]
-            if (not pd.isna(vr) and vr >= 2.0 and
-                    not pd.isna(bw) and not pd.isna(bwm) and bw > bwm):
-                fired.append("②")
-        # 系統①: 月木 × 18〜23時 × 3月・7月除外
-        if wd in (0, 3) and hr in (18, 19, 20, 21, 22, 23) and month not in (3, 7):
-            fired.append("①")
+        # 系統②: 年平均+14万円のため本番除外中
+        # if wd in (1, 2) and month not in (5, 6, 7, 8, 9):
+        #     vr  = row["vol_ratio"]
+        #     bw  = row["bb_width"]
+        #     bwm = row["bb_width_ma20"]
+        #     if (not pd.isna(vr) and vr >= 2.0 and
+        #             not pd.isna(bw) and not pd.isna(bwm) and bw > bwm):
+        #         fired.append("②")
+        # 系統①: 月火水 × 8/12/15/18/19/20/21/23時 × 3月・7月除外
+        if wd in (0, 1, 2) and hr in (8, 12, 15, 18, 19, 20, 21, 23) and month not in (3, 7):
+            if micro_monthly_skip:
+                log(f"[系統①] 月次DD制限中のためスキップ ({micro_monthly_pnl:,.0f}円)")
+            else:
+                fired.append("①")
 
     # ── 系統③（short 基本条件）──
-    below_ma = (c2 < m9p2 and c2 < m10p2 and c1 < m9p and c1 < m10p)
-    touch_hi = (abs(hi - m9)  / m9  <= TOUCH_PCT or
-                abs(hi - m10) / m10 <= TOUCH_PCT)
+    # バックテスト（PF1.440・パターン⑤）条件と統一: MA9 < MA20（MA同士の大小比較・1本分）
+    m20      = row["ma20"]
+    below_ma = (m9 < m20)
+    touch_hi = (abs(hi - m9) / m9 <= TOUCH_PCT)
     dc       = (row["macd"] < row["macd_sig"])
 
     if below_ma and touch_hi and dc:
@@ -790,8 +795,8 @@ def check_micro_signal(df):
             now_dt = dt.to_pydatetime() if hasattr(dt, "to_pydatetime") else dt
 
             # ── 月次DD制限チェック（リセットは check_micro_entry() 先頭で実施）──
-            if s3_monthly_skip:
-                log(f"[系統③] 月次DD制限中のためスキップ ({s3_monthly_pnl:,.0f}円)")
+            if micro_monthly_skip:
+                log(f"[系統③] 月次DD制限中のためスキップ ({micro_monthly_pnl:,.0f}円)")
                 return fired  # ③はfiredに追加しない
 
             # DST対応時間帯フィルター
@@ -1125,7 +1130,7 @@ def monitor_micro_dry(now, hhmm, verbose=False):
 
         if reason:
             sys_label = pos.get("system", "?")
-            prefix = f"[MICRO{'③' if sys_label=='③' else ''}]"
+            prefix = f"[MICRO{sys_label}]"
 
             # ── 本番モード処理 ──
             if not MICRO_DRY_RUN:
@@ -1164,14 +1169,14 @@ def monitor_micro_dry(now, hhmm, verbose=False):
             })
             log(f"[EXIT] {prefix} 系統{sys_label} 決済:{reason} @ {cp:.0f}  損益:{pnl:+.0f}  本日累計:{micro_dry_day_pnl:+.0f}")
 
-            # ── 系統③ 月次ドローダウン累計更新 ──
-            if sys_label == "③":
-                global s3_monthly_pnl, s3_monthly_skip
-                trade_yen = round(pnl * S3_PT_TO_YEN - S3_COMMISSION_YEN, 0)
-                s3_monthly_pnl += trade_yen
-                if s3_monthly_pnl <= S3_MONTHLY_DD_LIMIT and not s3_monthly_skip:
-                    s3_monthly_skip = True
-                    log(f"[系統③] 月次DD制限発動: 累計{s3_monthly_pnl:,.0f}円 → 今月の残りをスキップ")
+            # ── 系統①③合算 月次ドローダウン累計更新 ──
+            if sys_label in ("①", "③"):
+                global micro_monthly_pnl, micro_monthly_skip
+                trade_yen = round(pnl * MICRO_PT_TO_YEN - MICRO_COMMISSION_YEN, 0)
+                micro_monthly_pnl += trade_yen
+                if micro_monthly_pnl <= MICRO_MONTHLY_DD_LIMIT and not micro_monthly_skip:
+                    micro_monthly_skip = True
+                    log(f"[MICRO①③] 月次DD制限発動: 累計{micro_monthly_pnl:,.0f}円 → 今月の残りをスキップ")
             LOG_DIR.mkdir(exist_ok=True)
             all_file = LOG_DIR / "micro_dry_log_all.csv"
             last_trade = pd.DataFrame([micro_dry_trade_log[-1]])
@@ -1192,15 +1197,15 @@ def monitor_micro_dry(now, hhmm, verbose=False):
 # =========================
 def check_micro_entry(now, micro_board):
     global micro_dry_positions, micro_last_signal_bar_time, micro_warmup_remaining
-    global s3_monthly_pnl, s3_monthly_skip, s3_current_month
+    global micro_monthly_pnl, micro_monthly_skip, micro_current_month
 
-    # ── 系統③ 月次リセット（シグナル条件に関わらず毎足チェック）──
+    # ── 系統①③合算 月次リセット（シグナル条件に関わらず毎足チェック）──
     now_ym = (now.year, now.month)
-    if s3_current_month != now_ym:
-        s3_current_month = now_ym
-        s3_monthly_pnl   = 0.0
-        s3_monthly_skip  = False
-        log(f"[系統③] 月次リセット: {now_ym} 累計損益リセット")
+    if micro_current_month != now_ym:
+        micro_current_month = now_ym
+        micro_monthly_pnl   = 0.0
+        micro_monthly_skip  = False
+        log(f"[MICRO①③] 月次リセット: {now_ym} 累計損益リセット")
 
     df = micro_bars_to_df()
     if df is None or len(df) < 30:
@@ -1266,7 +1271,7 @@ def check_micro_entry(now, micro_board):
             "slip_est":    slip_est,
         }
 
-        prefix = "[MICRO③]" if sig == "③" else "[MICRO-DRY]"
+        prefix = f"[MICRO{sig}]"
         direction = "SHORT" if side == "short" else "LONG"
         bid_str  = f"{best_bid:.0f}" if best_bid else "---"
         ask_str  = f"{best_ask:.0f}" if best_ask else "---"
@@ -1368,7 +1373,9 @@ def main():
             if mdf is not None:
                 save_micro_csv(mdf)
             # 深夜終了時はトレード都度保存済みのため追加保存不要
-            log(f"[OK] 深夜終了  1570損益:{day_pnl:+.0f}円  マイクロDRY:{micro_dry_day_pnl:+.0f}pt  保有中:{len(micro_dry_positions)}件")
+            _n_trades = len(micro_dry_trade_log)
+            _net_pt   = micro_dry_day_pnl - _n_trades * 2.2   # 往復手数料2.2pt×トレード数を控除
+            log(f"[OK] 深夜終了  1570損益:{day_pnl:+.0f}円  マイクロDRY:{_net_pt:+.1f}pt(手数料控除後, {_n_trades}trades)  保有中:{len(micro_dry_positions)}件")
             break
 
         # ── 認証エラー上限チェック ──
