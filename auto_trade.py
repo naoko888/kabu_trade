@@ -1208,13 +1208,19 @@ def check_micro_entry(now, micro_board):
         log(f"[MICRO①③] 月次リセット: {now_ym} 累計損益リセット")
 
     df = micro_bars_to_df()
-    if df is None or len(df) < 30:
+    if df is None or len(df) < 31:   # 確定足30本 + current_bar 1本 = 最低31本
         return
 
     df = add_micro_indicators(df)
-    latest_bar_time = df.iloc[-1]["datetime"]
+
+    # ── 確定済み足のみでシグナル評価（BT との整合）──
+    # df.iloc[-1] = micro_current_bar（未確定・1tick目から書き換わる）
+    # df.iloc[-2] = 直前の確定済み足（BTが評価するのと同じ final OHLC）
+    # current_bar を除いた確定足列でシグナル判定し、5分前の完成足を基準にロックする
+    df_confirmed    = df.iloc[:-1]                        # current_bar を除外
+    latest_bar_time = df_confirmed.iloc[-1]["datetime"]   # 最後の確定足の開始時刻
     if micro_last_signal_bar_time == latest_bar_time:
-        return  # 同一足で重複判定しない
+        return  # 同一確定足で重複判定しない
 
     micro_last_signal_bar_time = latest_bar_time
 
@@ -1224,12 +1230,12 @@ def check_micro_entry(now, micro_board):
         log(f"[MICRO] ウォームアップ中 残り{micro_warmup_remaining}本")
         return
 
-    fired = check_micro_signal(df)
+    fired = check_micro_signal(df_confirmed)
 
     if not fired:
         cp = get_price_from_board(micro_board)
         cp_str = f"{float(cp):.0f}" if cp else "取得失敗"
-        log(f"[MICRO] → シグナルなし (現在値:{cp_str} bars:{len(df)}本)")
+        log(f"[MICRO] → シグナルなし (現在値:{cp_str} bars:{len(df_confirmed)}本)")
         return
 
     cp = get_price_from_board(micro_board)
