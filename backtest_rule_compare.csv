@@ -1,0 +1,4 @@
+﻿rule,rule_name,stop,tp,n,win_rate,pnl,pf,max_dd,monthly_avg,monthly_min,monthly_max
+寄り後レンジブレイク,rule3_opening_range_break,10,20,2,50.0,-12.0,0.429,-21.0,-6.0,-21.0,9.0
+押し目順張り,rule1_pullback_break,10,20,78,16.7,-1250.0,0.086,-1238.0,-250.0,-453.0,-21.0
+MA並び順トレンド,rule2_ma_trend,10,15,147,27.9,-2202.0,0.081,-2185.0,-440.4,-709.0,-59.0

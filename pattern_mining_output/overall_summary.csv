@@ -1,0 +1,4 @@
+﻿horizon,up_threshold,down_threshold,n,strong_up_count,strong_up_rate_pct,strong_down_count,strong_down_rate_pct,avg_up_move,avg_down_move,avg_close_move
+3,40,-40,167131,57679,34.51,58326,34.9,41.34,-42.28,0.37
+6,80,-80,167131,37152,22.23,39174,23.44,62.25,-64.0,0.74
+12,120,-120,167131,36520,21.85,38873,23.26,94.31,-97.41,1.48

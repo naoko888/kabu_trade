@@ -1,0 +1,878 @@
+import os
+import time
+import math
+import requests
+import pandas as pd
+import numpy as np
+import pytz
+from datetime import datetime, date
+
+# =========================
+# 設定
+# =========================
+API_BASE = "http://localhost:18080/kabusapi"
+API_PASSWORD = "sakimono35oku"
+
+# 1570 ETF
+SYMBOL   = "1570"
+EXCHANGE = 1
+LOT      = 1
+STOP     = 100
+TP       = 250
+BARS     = 4
+
+MAX_LOSS_DAY    = 300
+MAX_CONSEC_LOSS = 3
+BB_SQ_TH        = 0.90
+ATR_RATIO_TH    = 0.70
+CSV_FILE         = "1570_5min.csv"
+
+# マイクロ先物DRY検証
+MICRO_TP            = 120
+MICRO_SL            = 40
+MICRO_MAX_HOLD_BARS = 6
+MICRO_CSV_FILE      = "micro_live_5min.csv"
+MICRO_DERIV_MONTH   = "202606"
+
+POLL_SEC = 1.0
+DRY_RUN  = True   # True=1570もDRY（注文なし）
+
+JST = pytz.timezone("Asia/Tokyo")
+
+# =========================
+# グローバル状態
+# =========================
+token    = None
+position = None
+day_pnl  = 0
+consec_loss = 0
+trade_log   = []
+signal_log  = []
+consecutive_auth_errors = 0
+MAX_AUTH_ERRORS  = 5
+last_reauth_time = 0
+REAUTH_COOLDOWN  = 10
+
+# 1570 5分足
+current_bar    = None
+completed_bars = []
+last_cum_volume = None
+last_price      = None
+last_signal_bar_time = None
+
+# 1570 DRY
+dry_position  = None
+dry_day_pnl   = 0
+dry_trade_log = []
+
+# マイクロ先物
+MICRO_SYMBOL   = None
+MICRO_EXCHANGE = None
+
+micro_current_bar    = None
+micro_completed_bars = []
+micro_last_cum_vol   = None
+micro_last_signal_bar_time = None
+
+# マイクロ DRY
+micro_dry_position  = None
+micro_dry_day_pnl   = 0
+micro_dry_trade_log = []
+
+
+# =========================
+# 共通
+# =========================
+def floor_5min(dt: datetime) -> datetime:
+    return dt.replace(second=0, microsecond=0, minute=(dt.minute // 5) * 5)
+
+def headers():
+    return {"Content-Type": "application/json", "X-API-KEY": token}
+
+def safe_json(res):
+    try:
+        return res.json()
+    except Exception:
+        return {"raw": res.text}
+
+def log(msg):
+    print(f"[{datetime.now(JST).strftime('%H:%M:%S')}] {msg}")
+
+
+# =========================
+# トークン・再接続
+# =========================
+def get_token():
+    global token
+    res = requests.post(f"{API_BASE}/token", json={"APIPassword": API_PASSWORD}, timeout=10)
+    if res.status_code == 200:
+        token = res.json()["Token"]
+        log(f"✅ トークン取得成功: {token[:8]}...")
+        return True
+    log(f"❌ トークン取得失敗: {res.text}")
+    return False
+
+def get_micro_symbol():
+    global MICRO_SYMBOL, MICRO_EXCHANGE
+    for code in ["NK225micro", "NK225mini"]:
+        url = f"{API_BASE}/symbolname/future?FutureCode={code}&DerivMonth={MICRO_DERIV_MONTH}"
+        try:
+            res = requests.get(url, headers=headers(), timeout=10)
+        except requests.RequestException as e:
+            log(f"⚠ マイクロシンボル取得失敗({code}): {e}")
+            continue
+        if res.status_code != 200:
+            continue
+        data = res.json()
+        sym = data.get("Symbol")
+        if not sym:
+            continue
+        MICRO_SYMBOL   = sym
+        MICRO_EXCHANGE = data.get("Exchange") or 2
+        log(f"✅ マイクロシンボル取得({code}): {MICRO_SYMBOL} / Exchange={MICRO_EXCHANGE}")
+        return True
+    log("⚠ マイクロシンボル取得失敗 → マイクロ検証スキップ")
+    return False
+
+def register_symbol(retries=5, interval=2.0):
+    symbols = [{"Symbol": SYMBOL, "Exchange": EXCHANGE}]
+    if MICRO_SYMBOL:
+        symbols.append({"Symbol": MICRO_SYMBOL, "Exchange": MICRO_EXCHANGE})
+
+    for i in range(retries):
+        res = requests.put(
+            f"{API_BASE}/register",
+            headers=headers(),
+            json={"Symbols": symbols},
+            timeout=10
+        )
+        if res.status_code == 200:
+            log(f"✅ 銘柄登録成功 ({len(symbols)}銘柄)")
+            return True
+        log(f"❌ 銘柄登録失敗({i+1}/{retries}): {res.text}")
+        time.sleep(interval)
+    return False
+
+def refresh_token_and_reregister():
+    global consecutive_auth_errors, last_reauth_time
+    now_ts = time.time()
+    if now_ts - last_reauth_time < REAUTH_COOLDOWN:
+        log(f"⏳ 再認証クールダウン中 ({REAUTH_COOLDOWN}秒) → スキップ")
+        return False
+    log("🔄 トークン再取得を実行")
+    last_reauth_time = now_ts
+    if not get_token():
+        consecutive_auth_errors += 1
+        return False
+    time.sleep(1.0)
+    if not register_symbol():
+        consecutive_auth_errors += 1
+        return False
+    consecutive_auth_errors = 0
+    return True
+
+def request_with_reauth(method, path, *, json_body=None, retry=1):
+    global consecutive_auth_errors
+    url = f"{API_BASE}{path}"
+    try:
+        res = requests.request(
+            method=method, url=url,
+            headers=headers() if token else {"Content-Type": "application/json"},
+            json=json_body, timeout=10
+        )
+    except requests.RequestException as e:
+        log(f"⚠ 通信エラー: {e}")
+        return None
+
+    if res.status_code == 200:
+        consecutive_auth_errors = 0
+        return res
+
+    txt = res.text or ""
+    token_error = (res.status_code == 401) or ("APIキー不一致" in txt) or ("Unauthorized" in txt)
+
+    if token_error and retry > 0:
+        log("⚠ 認証エラー検出 → トークン再取得(1回のみ)")
+        ok = refresh_token_and_reregister()
+        if not ok:
+            log(f"❌ トークン再取得失敗 (連続失敗: {consecutive_auth_errors}/{MAX_AUTH_ERRORS})")
+            return None
+        return request_with_reauth(method, path, json_body=json_body, retry=retry - 1)
+
+    if token_error and retry <= 0:
+        consecutive_auth_errors += 1
+        log(f"❌ 再取得後も認証エラー → 諦め (連続失敗: {consecutive_auth_errors}/{MAX_AUTH_ERRORS})")
+    else:
+        log(f"⚠ APIエラー {res.status_code}: {txt}")
+    return None
+
+
+# =========================
+# 板取得
+# =========================
+def get_board():
+    res = request_with_reauth("GET", f"/board/{SYMBOL}@{EXCHANGE}")
+    return safe_json(res) if res else None
+
+def get_micro_board():
+    if not MICRO_SYMBOL:
+        return None
+    res = request_with_reauth("GET", f"/board/{MICRO_SYMBOL}@{MICRO_EXCHANGE}")
+    return safe_json(res) if res else None
+
+def get_price_from_board(board):
+    p = board.get("CurrentPrice")
+    if p is not None:
+        return p
+    bid = board.get("BidPrice")
+    ask = board.get("AskPrice")
+    if bid and ask:
+        return (float(bid) + float(ask)) / 2
+    return bid or ask
+
+def get_current_price():
+    board = get_board()
+    return get_price_from_board(board) if board else None
+
+
+# =========================
+# 1570 5分足生成
+# =========================
+def start_new_bar(bar_time, price, vol_delta):
+    return {"datetime": bar_time, "open": price, "high": price, "low": price, "close": price, "volume": max(vol_delta, 0)}
+
+def update_bar_from_board(board):
+    global current_bar, completed_bars, last_cum_volume, last_price
+
+    now      = datetime.now(JST)
+    bar_time = floor_5min(now)
+    price    = get_price_from_board(board)
+    if price is None:
+        return
+    price      = float(price)
+    cum_volume = board.get("TradingVolume")
+
+    vol_delta = 0
+    if cum_volume is not None:
+        try:
+            cum_volume = int(cum_volume)
+            if last_cum_volume is not None and cum_volume >= last_cum_volume:
+                vol_delta = cum_volume - last_cum_volume
+            last_cum_volume = cum_volume
+        except Exception:
+            pass
+
+    last_price = price
+
+    if current_bar is None:
+        current_bar = start_new_bar(bar_time, price, vol_delta)
+        return
+    if current_bar["datetime"] != bar_time:
+        completed_bars.append(current_bar)
+        current_bar = start_new_bar(bar_time, price, vol_delta)
+        return
+    current_bar["high"]    = max(current_bar["high"], price)
+    current_bar["low"]     = min(current_bar["low"], price)
+    current_bar["close"]   = price
+    current_bar["volume"] += max(vol_delta, 0)
+
+def bars_to_df():
+    rows = completed_bars.copy()
+    if current_bar is not None:
+        rows.append(current_bar.copy())
+    if not rows:
+        return None
+    df = pd.DataFrame(rows)
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    df = df.drop_duplicates(subset=["datetime"], keep="last").sort_values("datetime")
+    df = df.set_index("datetime")
+    return df
+
+def save_csv(df):
+    if df is None or df.empty:
+        return
+    if os.path.exists(CSV_FILE):
+        existing = pd.read_csv(CSV_FILE, parse_dates=["datetime"]).set_index("datetime")
+        combined = pd.concat([existing, df])
+        combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+    else:
+        combined = df.copy()
+    combined.to_csv(CSV_FILE, encoding="utf-8-sig")
+    log(f"📁 CSV保存: {CSV_FILE}")
+
+
+# =========================
+# マイクロ 5分足生成
+# =========================
+def update_micro_bar(board):
+    global micro_current_bar, micro_completed_bars, micro_last_cum_vol
+
+    price = get_price_from_board(board)
+    if price is None:
+        return
+    price      = float(price)
+    now        = datetime.now(JST)
+    bar_time   = floor_5min(now)
+    cum_volume = board.get("TradingVolume")
+
+    vol_delta = 0
+    if cum_volume is not None:
+        try:
+            cum_volume = int(cum_volume)
+            if micro_last_cum_vol is not None and cum_volume >= micro_last_cum_vol:
+                vol_delta = cum_volume - micro_last_cum_vol
+            micro_last_cum_vol = cum_volume
+        except Exception:
+            pass
+
+    if micro_current_bar is None:
+        micro_current_bar = start_new_bar(bar_time, price, vol_delta)
+        return
+    if micro_current_bar["datetime"] != bar_time:
+        micro_completed_bars.append(micro_current_bar)
+        micro_current_bar = start_new_bar(bar_time, price, vol_delta)
+        return
+    micro_current_bar["high"]    = max(micro_current_bar["high"], price)
+    micro_current_bar["low"]     = min(micro_current_bar["low"], price)
+    micro_current_bar["close"]   = price
+    micro_current_bar["volume"] += max(vol_delta, 0)
+
+def micro_bars_to_df():
+    rows = micro_completed_bars.copy()
+    if micro_current_bar is not None:
+        rows.append(micro_current_bar.copy())
+    if not rows:
+        return None
+    df = pd.DataFrame(rows)
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    df = df.drop_duplicates(subset=["datetime"], keep="last").sort_values("datetime").reset_index(drop=True)
+    return df
+
+def save_micro_csv(df):
+    if df is None or df.empty:
+        return
+    df_save = df.set_index("datetime")
+    if os.path.exists(MICRO_CSV_FILE):
+        existing = pd.read_csv(MICRO_CSV_FILE, parse_dates=["datetime"]).set_index("datetime")
+        combined = pd.concat([existing, df_save])
+        combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+    else:
+        combined = df_save.copy()
+    combined.to_csv(MICRO_CSV_FILE, encoding="utf-8-sig")
+    log(f"📁 マイクロCSV保存: {MICRO_CSV_FILE}")
+
+
+# =========================
+# 1570 指標・シグナル
+# =========================
+def add_indicators(df):
+    df = df.copy()
+    df["ma20"]     = df["close"].rolling(20).mean()
+    df["ma_slope"] = df["ma20"] - df["ma20"].shift(1)
+
+    prev_close = df["close"].shift(1)
+    tr1 = df["high"] - df["low"]
+    tr2 = (df["high"] - prev_close).abs()
+    tr3 = (df["low"]  - prev_close).abs()
+    df["tr"]      = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    df["atr14"]   = df["tr"].rolling(14).mean()
+    df["atr_avg"] = df["atr14"].rolling(20).mean()
+
+    df["bb_std"]       = df["close"].rolling(20).std()
+    df["bb_width"]     = 4 * df["bb_std"]
+    df["bb_width_avg"] = df["bb_width"].rolling(20).mean()
+    df["bb_squeeze"]   = df["bb_width"] / df["bb_width_avg"]
+    return df
+
+def check_signal(df):
+    if df is None or len(df) < 3:
+        return None
+    i   = len(df) - 1
+    cur = df.iloc[i]
+    p1  = df.iloc[i - 1]
+    p2  = df.iloc[i - 2]
+
+    if pd.isna(cur["ma_slope"]) or cur["ma_slope"] <= 0:
+        return None
+    if (
+        not pd.isna(cur["bb_squeeze"]) and not pd.isna(cur["atr14"])
+        and not pd.isna(cur["atr_avg"]) and cur["atr_avg"] != 0
+    ):
+        if cur["bb_squeeze"] < BB_SQ_TH or cur["atr14"] < cur["atr_avg"] * ATR_RATIO_TH:
+            log(f"⚡ レンジ判定スキップ BB={cur['bb_squeeze']:.2f} ATR比={cur['atr14']/cur['atr_avg']:.2f}")
+            return None
+    if p2["high"] < p1["high"] and p2["low"] < p1["low"] and cur["high"] > p1["high"]:
+        return "long"
+    return None
+
+
+# =========================
+# マイクロ 指標・シグナル（backtest_micro.pyと同一）
+# =========================
+def add_micro_indicators(df):
+    df = df.copy()
+    df["ma20"]          = df["close"].rolling(20).mean()
+    df["ma20_slope"]    = df["ma20"] - df["ma20"].shift(1)
+    df["dist_ma20_pct"] = (df["close"] / df["ma20"] - 1.0) * 100
+
+    df["vol_ma20"]  = df["volume"].rolling(20).mean()
+    df["vol_ratio"] = df["volume"] / df["vol_ma20"]
+
+    diff    = df["close"].diff()
+    up      = diff.clip(lower=0)
+    down    = -diff.clip(upper=0)
+    roll_up = up.rolling(14).mean()
+    roll_dn = down.rolling(14).mean()
+    rs      = roll_up / roll_dn.replace(0, np.nan)
+    df["rsi14"] = 100 - (100 / (1 + rs))
+
+    df["gap_pct"] = df["open"] / df["close"].shift(1) - 1
+    return df
+
+def check_micro_signal(df):
+    if df is None or len(df) < 2:
+        return False
+    i    = len(df) - 1
+    cur  = df.iloc[i]
+    prev = df.iloc[i - 1]
+
+    if pd.isna(cur["ma20_slope"])    or cur["ma20_slope"] <= 0:       return False
+    if pd.isna(prev["dist_ma20_pct"]) or prev["dist_ma20_pct"] > -0.3: return False
+    if cur["close"] <= prev["high"]:                                    return False
+    if pd.isna(cur["vol_ratio"])     or cur["vol_ratio"] < 1.2:        return False
+    if pd.isna(cur["gap_pct"])       or cur["gap_pct"] < -0.2:         return False
+    if pd.isna(prev["rsi14"])        or prev["rsi14"] > 30:            return False
+    return True
+
+
+# =========================
+# 発注（1570用）
+# =========================
+def send_order(side, qty, order_type="market", stop_price=None, limit_price=None):
+    buy_sell = "1" if side == "buy" else "2"
+    body = {
+        "Password": API_PASSWORD, "Symbol": SYMBOL, "Exchange": EXCHANGE,
+        "SecurityType": 1, "Side": buy_sell, "CashMargin": 2,
+        "MarginTradeType": 3, "DelivType": 2, "FundType": "  ",
+        "AccountType": 4, "Qty": qty, "ExpireDay": 0,
+    }
+    if order_type == "market":
+        body["FrontOrderType"] = 10; body["Price"] = 0
+    elif order_type == "limit":
+        body["FrontOrderType"] = 20; body["Price"] = limit_price
+    elif order_type == "stop":
+        body["FrontOrderType"] = 30; body["Price"] = 0
+        body["ReverseLimitOrder"] = {
+            "TriggerSec": 1, "TriggerPrice": stop_price,
+            "UnderOver": 1, "AfterHitOrderType": 1, "AfterHitPrice": 0
+        }
+    else:
+        log("❌ 未対応の注文種別"); return None
+
+    res = request_with_reauth("POST", "/sendorder", json_body=body)
+    if res is None:
+        return None
+    order_id = safe_json(res).get("OrderId", "")
+    log(f"✅ 発注成功 OrderId: {order_id}")
+    return order_id
+
+
+# =========================
+# エントリー・決済（1570）
+# =========================
+def entry_long():
+    global position
+    cp = get_current_price()
+    if cp is None:
+        log("❌ 現在値取得失敗"); return
+    cp = float(cp)
+    log(f"🟢 ロングエントリー @ {cp:.0f}円 × {LOT}株")
+    order_id = send_order("buy", LOT, "market")
+    if not order_id:
+        return
+    time.sleep(1.5)
+    sl_price = cp - STOP
+    tp_price = cp + TP
+    log(f"🔴 損切り逆指値: {sl_price:.0f}円")
+    send_order("sell", LOT, "stop", stop_price=sl_price)
+    log(f"🟡 利確指値: {tp_price:.0f}円")
+    send_order("sell", LOT, "limit", limit_price=tp_price)
+    position = {
+        "side": "long", "entry_time": datetime.now(JST),
+        "entry_price": cp, "sl_price": sl_price, "tp_price": tp_price,
+        "qty": LOT, "order_id": order_id, "bars": 0,
+    }
+
+def close_position(reason):
+    global position, day_pnl, consec_loss, trade_log
+    if position is None:
+        return
+    cp = get_current_price()
+    if cp is None:
+        log("❌ 決済時の現在値取得失敗"); return
+    cp = float(cp)
+    log(f"🔵 決済: {reason} @ {cp:.0f}円")
+    send_order("sell", position["qty"], "market")
+    pnl = (cp - position["entry_price"]) * position["qty"]
+    day_pnl += pnl
+    consec_loss = consec_loss + 1 if pnl < 0 else 0
+    trade_log.append({
+        "entry_time": position["entry_time"].strftime("%Y-%m-%d %H:%M:%S"),
+        "exit_time": datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S"),
+        "entry_price": position["entry_price"], "exit_price": cp,
+        "pnl": pnl, "reason": reason,
+    })
+    log(f"損益: {pnl:+.0f}円 | 本日累計: {day_pnl:+.0f}円")
+    position = None
+    save_log()
+
+def save_log():
+    if not trade_log:
+        return
+    filename = f"trade_log_{date.today().strftime('%Y%m%d')}.csv"
+    pd.DataFrame(trade_log).to_csv(filename, index=False, encoding="utf-8-sig")
+    log(f"📊 ログ保存: {filename}")
+
+def save_signal_log():
+    if not signal_log:
+        return
+    filename = f"signal_log_{date.today().strftime('%Y%m%d')}.csv"
+    pd.DataFrame(signal_log).to_csv(filename, index=False, encoding="utf-8-sig")
+    log(f"📋 シグナルログ保存: {filename}")
+
+
+# =========================
+# マイクロ DRY 監視・ログ
+# =========================
+def monitor_micro_dry(now, hhmm, verbose=False):
+    global micro_dry_position, micro_dry_day_pnl, micro_dry_trade_log
+
+    if micro_dry_position is None:
+        return
+
+    board = get_micro_board()
+    if not board:
+        return
+    cp = get_price_from_board(board)
+    if cp is None:
+        return
+    cp  = float(cp)
+    pnl = cp - micro_dry_position["entry_price"]
+
+    reason = None
+    if cp <= micro_dry_position["sl_price"]:
+        reason = "SL到達"
+    elif cp >= micro_dry_position["tp_price"]:
+        reason = "TP到達"
+    elif hhmm >= 1540:
+        reason = "大引け強制決済"
+    else:
+        df_tmp = micro_bars_to_df()
+        if df_tmp is not None:
+            entry_bar = floor_5min(micro_dry_position["entry_time"])
+            elapsed   = int((floor_5min(now) - entry_bar).total_seconds() // 300)
+            micro_dry_position["bars"] = elapsed
+            if elapsed >= MICRO_MAX_HOLD_BARS:
+                reason = "時間決済"
+
+    if reason:
+        micro_dry_day_pnl += pnl
+        micro_dry_trade_log.append({
+            "entry_time":  micro_dry_position["entry_time"].strftime("%Y-%m-%d %H:%M:%S"),
+            "exit_time":   now.strftime("%Y-%m-%d %H:%M:%S"),
+            "entry_price": micro_dry_position["entry_price"],
+            "exit_price":  cp,
+            "pnl":         round(pnl, 1),
+            "reason":      reason,
+        })
+        log(f"🔵 [MICRO-DRY] 決済:{reason} @ {cp:.0f}  損益:{pnl:+.0f}  本日累計:{micro_dry_day_pnl:+.0f}")
+        micro_dry_position = None
+        filename = f"micro_dry_log_{date.today().strftime('%Y%m%d')}.csv"
+        pd.DataFrame(micro_dry_trade_log).to_csv(filename, index=False, encoding="utf-8-sig")
+        log(f"📊 マイクロDRYログ保存: {filename}")
+    elif verbose:
+        log(f"[MICRO-DRY] 保有中 @ {micro_dry_position['entry_price']:.0f}  含み:{pnl:+.0f}  bars={micro_dry_position.get('bars',0)}")
+
+def check_micro_entry(now, micro_board):
+    global micro_dry_position, micro_last_signal_bar_time
+
+    df = micro_bars_to_df()
+    if df is None or len(df) < 3:
+        return
+
+    df = add_micro_indicators(df)
+    latest_bar_time = df.iloc[-1]["datetime"]
+    if micro_last_signal_bar_time == latest_bar_time:
+        return
+
+    micro_last_signal_bar_time = latest_bar_time
+    sig = check_micro_signal(df)
+
+    if sig:
+        if micro_dry_position is None:
+            cp = get_price_from_board(micro_board)
+            if cp is not None:
+                cp = float(cp)
+                micro_dry_position = {
+                    "entry_time":  now,
+                    "entry_price": cp,
+                    "sl_price":    cp - MICRO_SL,
+                    "tp_price":    cp + MICRO_TP,
+                    "bars":        0,
+                }
+                log(f"🟢 [MICRO-DRY] エントリー @ {cp:.0f}  SL:{cp-MICRO_SL:.0f}  TP:{cp+MICRO_TP:.0f}")
+        else:
+            log("🟢 [MICRO-DRY] シグナルあり（仮想ポジション保有中のためスキップ）")
+    else:
+        cp = get_price_from_board(micro_board)
+        cp_str = f"{float(cp):.0f}" if cp else "取得失敗"
+        log(f"[MICRO] → シグナルなし (現在値:{cp_str} bars:{len(df)}本)")
+
+
+# =========================
+# メイン
+# =========================
+def main():
+    global last_signal_bar_time, position, dry_position, dry_day_pnl, dry_trade_log
+    global micro_dry_position, micro_dry_day_pnl, micro_dry_trade_log
+
+    print("=" * 60)
+    print("1570 自動売買 + マイクロ先物DRY検証 起動")
+    print(f"1570: 損切り:-{STOP} 利確:+{TP} LOT:{LOT}  DRY_RUN={DRY_RUN}")
+    print(f"マイクロ: SL:{MICRO_SL} TP:{MICRO_TP} BARS:{MICRO_MAX_HOLD_BARS} (DRYのみ)")
+    print("=" * 60)
+
+    if not get_token():
+        log("❌ トークン取得失敗 → 起動中止")
+        return
+    time.sleep(1.0)
+    get_micro_symbol()   # 失敗してもマイクロ検証なしで続行
+    if not register_symbol():
+        log("❌ 銘柄登録失敗 → 起動中止")
+        return
+
+    last_csv_min       = -1
+    last_micro_csv_min = -1
+    last_verbose_min   = -1   # 間引きログ用（5分ごとのみ出力）
+
+    while True:
+        now     = datetime.now(JST)
+        hhmm    = now.hour * 100 + now.minute
+        weekday = now.weekday()
+        verbose = (now.minute % 5 == 0 and now.minute != last_verbose_min)
+        if verbose:
+            last_verbose_min = now.minute
+
+        if weekday >= 5:
+            log("土日のため終了")
+            break
+
+        # 15:00終了
+        if hhmm >= 1500:
+            if position:
+                close_position("大引け強制決済")
+            df = bars_to_df()
+            if df is not None:
+                save_csv(df)
+            save_log()
+            # マイクロ終了処理
+            mdf = micro_bars_to_df()
+            if mdf is not None:
+                save_micro_csv(mdf)
+            if micro_dry_trade_log:
+                filename = f"micro_dry_log_{date.today().strftime('%Y%m%d')}.csv"
+                pd.DataFrame(micro_dry_trade_log).to_csv(filename, index=False, encoding="utf-8-sig")
+            log(f"✅ 終了  1570損益:{day_pnl:+.0f}円  マイクロDRY:{micro_dry_day_pnl:+.0f}円")
+            break
+
+        if consecutive_auth_errors >= MAX_AUTH_ERRORS:
+            log(f"❌ 認証エラー{MAX_AUTH_ERRORS}回連続 → 安全終了")
+            if position:
+                log("⚠ ポジションが残っています。手動で確認してください。")
+            df = bars_to_df()
+            if df is not None:
+                save_csv(df)
+            save_log()
+            break
+
+        # 寄り前 / 昼休み
+        if hhmm < 900 or (1130 <= hhmm < 1230):
+            time.sleep(1)
+            continue
+
+        # ── 板取得 ──
+        board = get_board()
+        if board:
+            update_bar_from_board(board)
+
+        micro_board = get_micro_board()
+        if micro_board and micro_board.get("CurrentPrice"):
+            update_micro_bar(micro_board)
+
+        # ── CSV保存（5分ごと） ──
+        if now.minute % 5 == 0 and now.minute != last_csv_min and now.second < 2:
+            df = bars_to_df()
+            if df is not None:
+                save_csv(df)
+            last_csv_min = now.minute
+
+        if now.minute % 5 == 0 and now.minute != last_micro_csv_min and now.second < 2 and MICRO_SYMBOL:
+            mdf = micro_bars_to_df()
+            if mdf is not None:
+                save_micro_csv(mdf)
+            last_micro_csv_min = now.minute
+
+        # ── 1570 DRY ポジション監視 ──
+        if DRY_RUN and dry_position is not None:
+            cp = get_current_price()
+            if cp is not None:
+                cp  = float(cp)
+                pnl = cp - dry_position["entry_price"]
+                reason = None
+                if cp <= dry_position["sl_price"]:
+                    reason = "SL到達"
+                elif cp >= dry_position["tp_price"]:
+                    reason = "TP到達"
+                elif 1125 <= hhmm <= 1130:
+                    reason = "昼休み前強制決済"
+                elif hhmm >= 1500:
+                    reason = "大引け強制決済"
+                else:
+                    df_tmp = bars_to_df()
+                    if df_tmp is not None:
+                        elapsed = int((df_tmp.index[-1] - floor_5min(dry_position["entry_time"])).total_seconds() // 300)
+                        dry_position["bars"] = max(dry_position.get("bars", 0), elapsed)
+                        if dry_position["bars"] >= BARS:
+                            reason = "時間決済"
+                if reason:
+                    dry_day_pnl += pnl
+                    dry_trade_log.append({
+                        "entry_time": dry_position["entry_time"].strftime("%Y-%m-%d %H:%M:%S"),
+                        "exit_time": now.strftime("%Y-%m-%d %H:%M:%S"),
+                        "entry_price": dry_position["entry_price"],
+                        "exit_price": cp, "pnl": pnl, "reason": reason,
+                    })
+                    log(f"🔵 [DRY] 決済:{reason} @ {cp:.0f}円  損益:{pnl:+.0f}円  本日累計:{dry_day_pnl:+.0f}円")
+                    dry_position = None
+                    pd.DataFrame(dry_trade_log).to_csv(
+                        f"dry_trade_log_{date.today().strftime('%Y%m%d')}.csv",
+                        index=False, encoding="utf-8-sig"
+                    )
+                elif verbose:
+                    log(f"[DRY] 保有中 @ {dry_position['entry_price']:.0f}円  含み:{pnl:+.0f}円  bars={dry_position.get('bars',0)}")
+
+        # ── マイクロ DRY ポジション監視 ──
+        if MICRO_SYMBOL:
+            monitor_micro_dry(now, hhmm, verbose=verbose)
+
+        # ── 1570 実ポジション監視 ──
+        if position is not None:
+            df = bars_to_df()
+            if df is not None and len(df) >= 2:
+                elapsed_bars = int((df.index[-1] - floor_5min(position["entry_time"])).total_seconds() // 300)
+                position["bars"] = max(position["bars"], elapsed_bars)
+            cp = get_current_price()
+            if cp is not None and verbose:
+                log(f"保有中 含み損益: {float(cp) - position['entry_price']:+.0f}円 / bars={position['bars']}")
+            if 1125 <= hhmm <= 1130:
+                close_position("昼休み前強制決済")
+                time.sleep(1)
+                continue
+            if position["bars"] >= BARS:
+                close_position("時間決済")
+            time.sleep(POLL_SEC)
+            continue
+
+        # 9:15まではデータ収集のみ
+        if hhmm < 915:
+            time.sleep(POLL_SEC)
+            continue
+
+        # ── 1570 損失制限チェック ──
+        if day_pnl <= -MAX_LOSS_DAY:
+            log(f"本日損失上限到達 {day_pnl:+.0f}円 → 新規停止")
+            time.sleep(POLL_SEC)
+            continue
+        if consec_loss >= MAX_CONSEC_LOSS:
+            log(f"{MAX_CONSEC_LOSS}連敗 → 新規停止")
+            time.sleep(POLL_SEC)
+            continue
+        if hhmm >= 1300:
+            # 1570は新規エントリーなし、マイクロは継続して判定
+            if MICRO_SYMBOL and micro_board and micro_board.get("CurrentPrice"):
+                check_micro_entry(now, micro_board)
+            time.sleep(POLL_SEC)
+            continue
+
+        # ── 1570 シグナル判定 ──
+        df = bars_to_df()
+        if df is None or len(df) < 3:
+            if verbose:
+                log(f"⏳ 1570データ蓄積中 ({len(df) if df is not None else 0}/3本)")
+            time.sleep(POLL_SEC)
+            continue
+
+        df = add_indicators(df)
+        latest_bar_time = df.index[-1]
+        if last_signal_bar_time != latest_bar_time:
+            last_signal_bar_time = latest_bar_time
+            sig = check_signal(df)
+
+            if sig is None:
+                cp = get_current_price()
+                price_str = f"{float(cp):.0f}円" if cp else "取得失敗"
+                log(f"[1570] → シグナルなし (現在値:{price_str} bars:{len(df)}本)")
+
+            if sig == "long":
+                cp = get_current_price()
+                cp_f = float(cp) if cp is not None else None
+                entered = "no"
+                if DRY_RUN:
+                    if dry_position is None:
+                        if cp_f is not None:
+                            dry_position = {
+                                "entry_time": now, "entry_price": cp_f,
+                                "sl_price": cp_f - STOP, "tp_price": cp_f + TP, "bars": 0,
+                            }
+                            log(f"🟢 [DRY] ロングエントリー @ {cp_f:.0f}円  SL:{cp_f-STOP:.0f}  TP:{cp_f+TP:.0f}")
+                            entered = "yes"
+                    else:
+                        log("🟢 [DRY] シグナルあり（仮想ポジション保有中のためスキップ）")
+                else:
+                    log("🟢 ロングシグナル")
+                    entry_long()
+                    entered = "yes"
+                signal_log.append({
+                    "datetime": now.strftime("%Y-%m-%d %H:%M:%S"),
+                    "price":    cp_f,
+                    "signal":   "long",
+                    "entered":  entered,
+                })
+                save_signal_log()
+
+        # ── マイクロ シグナル判定 ──
+        if MICRO_SYMBOL and micro_board and micro_board.get("CurrentPrice"):
+            check_micro_entry(now, micro_board)
+
+        time.sleep(POLL_SEC)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        log("⛔ 手動停止")
+        if position:
+            log("⚠ ポジションが残っています")
+        df = bars_to_df()
+        if df is not None:
+            save_csv(df)
+        save_log()
+        mdf = micro_bars_to_df()
+        if mdf is not None:
+            save_micro_csv(mdf)
+        if micro_dry_trade_log:
+            pd.DataFrame(micro_dry_trade_log).to_csv(
+                f"micro_dry_log_{date.today().strftime('%Y%m%d')}.csv",
+                index=False, encoding="utf-8-sig"
+            )

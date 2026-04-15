@@ -1,0 +1,7 @@
+﻿n,win_rate,pnl,pf,expectancy,max_dd,params
+233,12.45,-5499.0,0.13,-23.601,-5497.0,"{'ma_len': 20, 'vol_mult': 1.2, 'bb_th': 0.9, 'atr_ratio': 0.7, 'stop': 20, 'tp': 40, 'hold_bars': 3, 'entry_start': 915, 'entry_end': 1030}"
+256,11.72,-6152.0,0.122,-24.031,-6150.0,"{'ma_len': 20, 'vol_mult': 1.1, 'bb_th': 0.9, 'atr_ratio': 0.7, 'stop': 20, 'tp': 40, 'hold_bars': 3, 'entry_start': 915, 'entry_end': 1030}"
+203,10.34,-5049.0,0.105,-24.872,-5047.0,"{'ma_len': 20, 'vol_mult': 1.3, 'bb_th': 0.9, 'atr_ratio': 0.7, 'stop': 20, 'tp': 40, 'hold_bars': 3, 'entry_start': 915, 'entry_end': 1030}"
+234,12.82,-5754.0,0.09,-24.59,-5742.0,"{'ma_len': 20, 'vol_mult': 1.2, 'bb_th': 0.9, 'atr_ratio': 0.7, 'stop': 20, 'tp': 30, 'hold_bars': 3, 'entry_start': 915, 'entry_end': 1030}"
+258,12.02,-6448.0,0.084,-24.992,-6436.0,"{'ma_len': 20, 'vol_mult': 1.1, 'bb_th': 0.9, 'atr_ratio': 0.7, 'stop': 20, 'tp': 30, 'hold_bars': 3, 'entry_start': 915, 'entry_end': 1030}"
+204,10.78,-5224.0,0.074,-25.608,-5212.0,"{'ma_len': 20, 'vol_mult': 1.3, 'bb_th': 0.9, 'atr_ratio': 0.7, 'stop': 20, 'tp': 30, 'hold_bars': 3, 'entry_start': 915, 'entry_end': 1030}"

@@ -1390,24 +1390,28 @@ def main():
             break
 
         # ── 板取得（共通）──
+        # バー更新は取引時間内のみ（5:55〜8:45、15:40〜17:00 の ghost bar 生成を防ぐ）
+        # get_board() / get_micro_board() 自体は常に実行し、
+        # monitor_micro_dry() / check_micro_entry() での価格参照を維持する
         board = get_board()
-        if board:
+        if board and is_trading_time(hhmm):
             update_bar_from_board(board)
 
         # マイクロ先物は昼休みなし（8:45〜15:40 通し取引）→ 昼休みチェックより前に実行
         micro_board = get_micro_board()
-        if micro_board and micro_board.get("CurrentPrice"):
+        if micro_board and micro_board.get("CurrentPrice") and is_trading_time(hhmm):
             update_micro_bar(micro_board)
 
         # ── CSV保存（5分ごと）──
-        if now.minute % 5 == 0 and now.minute != last_csv_min and now.second < 2:
+        # 取引時間外（5:55〜8:45、15:40〜17:00）は保存しない
+        if is_trading_time(hhmm) and now.minute % 5 == 0 and now.minute != last_csv_min and now.second < 2:
             df = bars_to_df()
             if df is not None:
                 save_csv(df)
             last_csv_min = now.minute
 
-        # マイクロ先物は昼休みなし → 昼休み中も保存を継続
-        if now.minute % 5 == 0 and now.minute != last_micro_csv_min and now.second < 2 and MICRO_SYMBOL:
+        # マイクロ先物は昼休みなし → 昼休み中も保存を継続（is_trading_time が 845〜1540 を含むため問題なし）
+        if is_trading_time(hhmm) and now.minute % 5 == 0 and now.minute != last_micro_csv_min and now.second < 2 and MICRO_SYMBOL:
             mdf = micro_bars_to_df()
             if mdf is not None:
                 save_micro_csv(mdf)

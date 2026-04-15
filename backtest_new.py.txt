@@ -1,0 +1,585 @@
+"""
+日経レバ（1570）バックテスト
+戦略：15分足 押し目買い・戻り売り自動売買
+"""
+
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import pytz
+import datetime
+
+# ══════════════════════════════════════════
+# 設定
+# ══════════════════════════════════════════
+
+JST = pytz.timezone("Asia/Tokyo")
+SYMBOL = "1570.T"
+NAME = "日経レバ"
+INTERVAL = "15m"
+PERIOD = "60d"
+
+# ── パラメータ ────────────────────────────
+
+# MA
+MA_LENGTH          = 20
+MA_SLOPE_LOOKBACK  = 5
+MA_SLOPE_THRESHOLD = 0.1      # 横ばい判定の傾き率閾値
+
+# BB
+BB_LENGTH          = 20
+BB_MULT            = 3.0
+BB_WIDTH_AVG_LEN   = 20
+BB_RATIO_MIN       = 0.8
+BB_RATIO_MAX       = 1.3
+RANGE_LONG_THRESH  = 0.2      # レンジロング：位置上限
+RANGE_SHORT_THRESH = 0.8      # レンジショート：位置下限
+
+# MACD
+MACD_FAST          = 12
+MACD_SLOW          = 26
+MACD_SIGNAL        = 9
+MACD_USE_GC_DC     = False    # True=GC/DC、False=上向き/下向き転換
+
+# 押し・戻り
+MA_PROXIMITY_PT    = 100      # MA近接判定値幅（円）
+
+# ヒゲ
+WICK_BODY_RATIO    = 2.0      # ヒゲ ≥ 実体 × この値
+WICK_RANGE_RATIO   = 0.5      # ヒゲ ≥ 全体 × この値
+
+# 急変禁止
+SPIKE_BAN_BARS     = 2        # 急変後の禁止本数
+
+# エントリー条件ON/OFF（4本目）
+ENTRY4_BULL_CANDLE = True     # 陽線確定
+ENTRY4_BREAKOUT_H  = True     # 前足高値上抜け
+ENTRY4_MACD_TURN   = True     # MACD転換
+
+# 3本目エントリー
+ENTRY3_ENABLED     = False
+ENTRY3_COND1       = True     # MA乖離以内
+ENTRY3_COND2       = True     # MACD>0かつ上向き
+ENTRY3_COND3       = False    # 実体サイズ
+ENTRY3_COND4       = False    # 高値更新幅
+ENTRY3_COND5       = False    # 浅い押し
+ENTRY3_MAX_DEV     = 200.0
+ENTRY3_MIN_BODY    = 50.0
+ENTRY3_SWING_LB    = 5
+ENTRY3_MIN_SWING   = 100.0
+ENTRY3_SHALLOW_PT  = 50.0
+
+# 損切り・利確
+SL_PT              = 100      # 損切り幅（円）
+TP_PT              = 200      # 利確幅（円）
+
+# ロング・ショートON/OFF
+LONG_ENABLED       = True
+SHORT_ENABLED      = True
+
+# ══════════════════════════════════════════
+# データ取得
+# ══════════════════════════════════════════
+
+def get_data():
+    print(f"📥 {NAME}データ取得中({INTERVAL})...")
+    df = yf.download(SYMBOL, period=PERIOD, interval=INTERVAL, progress=False)
+    df.columns = ["close", "high", "low", "open", "volume"]
+    df = df[["open", "high", "low", "close", "volume"]]
+    df = df.dropna()
+    print(f"✅ {len(df)}本取得成功！")
+    return df
+
+# ══════════════════════════════════════════
+# 指標計算
+# ══════════════════════════════════════════
+
+def calc_indicators(df):
+    # MA20
+    df["ma"] = df["close"].rolling(MA_LENGTH).mean()
+    df["ma_prev"] = df["ma"].shift(MA_SLOPE_LOOKBACK)
+
+    # BB ±3σ
+    df["bb_mid"]   = df["close"].rolling(BB_LENGTH).mean()
+    df["bb_std"]   = df["close"].rolling(BB_LENGTH).std()
+    df["bb_upper"] = df["bb_mid"] + BB_MULT * df["bb_std"]
+    df["bb_lower"] = df["bb_mid"] - BB_MULT * df["bb_std"]
+    df["bb_width"] = df["bb_upper"] - df["bb_lower"]
+    df["bb_width_avg"] = df["bb_width"].rolling(BB_WIDTH_AVG_LEN).mean()
+    df["bb_ratio"]    = df["bb_width"] / df["bb_width_avg"]
+    df["bb_position"] = (df["close"] - df["bb_lower"]) / df["bb_width"]
+
+    # MA傾き率
+    df["ma_slope"] = (df["ma"] - df["ma_prev"]).abs() / df["bb_width"]
+    df["ma_direction"] = df["ma"] - df["ma_prev"]  # 正=上向き 負=下向き
+
+    # MACD
+    ema_fast = df["close"].ewm(span=MACD_FAST, adjust=False).mean()
+    ema_slow = df["close"].ewm(span=MACD_SLOW, adjust=False).mean()
+    df["macd"]        = ema_fast - ema_slow
+    df["macd_signal"] = df["macd"].ewm(span=MACD_SIGNAL, adjust=False).mean()
+    df["macd_hist"]   = df["macd"] - df["macd_signal"]
+
+    return df
+
+# ══════════════════════════════════════════
+# 時間判定
+# ══════════════════════════════════════════
+
+def to_jst(dt):
+    if dt.tzinfo is not None:
+        return dt.astimezone(JST)
+    return JST.localize(dt)
+
+def get_hhmm(dt):
+    dt_jst = to_jst(dt)
+    return dt_jst.hour * 100 + dt_jst.minute
+
+def is_open_ban(hhmm):
+    return hhmm < 915
+
+def is_morning(hhmm):
+    return 915 <= hhmm <= 1130
+
+def is_lunch_ban(hhmm):
+    return 1230 <= hhmm <= 1244
+
+def is_afternoon(hhmm):
+    return 1245 <= hhmm <= 1359
+
+def is_no_entry(hhmm):
+    return hhmm >= 1400
+
+def is_force_close_morning(hhmm):
+    return hhmm >= 1225 and hhmm < 1230
+
+def is_force_close_end(hhmm):
+    return hhmm >= 1500
+
+def can_entry(hhmm, morning_count, afternoon_count):
+    if is_open_ban(hhmm):
+        return False
+    if is_lunch_ban(hhmm):
+        return False
+    if is_no_entry(hhmm):
+        return False
+    if is_morning(hhmm) and morning_count >= 1:
+        return False
+    if is_afternoon(hhmm) and afternoon_count >= 1:
+        return False
+    return True
+
+# ══════════════════════════════════════════
+# シグナル判定
+# ══════════════════════════════════════════
+
+def check_long_wick(row):
+    """長い下ヒゲ判定"""
+    body = abs(row["close"] - row["open"])
+    candle_range = row["high"] - row["low"]
+    lower_wick = min(row["open"], row["close"]) - row["low"]
+    if candle_range == 0:
+        return False
+    return (lower_wick >= WICK_BODY_RATIO * body) and \
+           (lower_wick >= WICK_RANGE_RATIO * candle_range)
+
+def check_short_wick(row):
+    """長い上ヒゲ判定"""
+    body = abs(row["close"] - row["open"])
+    candle_range = row["high"] - row["low"]
+    upper_wick = row["high"] - max(row["open"], row["close"])
+    if candle_range == 0:
+        return False
+    return (upper_wick >= WICK_BODY_RATIO * body) and \
+           (upper_wick >= WICK_RANGE_RATIO * candle_range)
+
+def higher_highs_3(df, i):
+    """直近3本の高値が連続切り上がり"""
+    if i < 2:
+        return False
+    return df["high"].iloc[i] > df["high"].iloc[i-1] > df["high"].iloc[i-2]
+
+def lower_lows_3(df, i):
+    """直近3本の安値が連続切り下がり"""
+    if i < 2:
+        return False
+    return df["low"].iloc[i] < df["low"].iloc[i-1] < df["low"].iloc[i-2]
+
+def lows_ok_long(df, i):
+    """安値条件（切り上がり理想、1本切り下げ+長い下ヒゲ許容）"""
+    if i < 2:
+        return False
+    # 理想：安値切り上がり
+    if df["low"].iloc[i] > df["low"].iloc[i-1] > df["low"].iloc[i-2]:
+        return True
+    # 許容：1本切り下げ＋長い下ヒゲ
+    if df["low"].iloc[i-1] < df["low"].iloc[i-2]:
+        return check_long_wick(df.iloc[i-1])
+    return False
+
+def highs_ok_short(df, i):
+    """高値条件（切り下がり理想、1本切り上げ+長い上ヒゲ許容）"""
+    if i < 2:
+        return False
+    # 理想：高値切り下がり
+    if df["high"].iloc[i] < df["high"].iloc[i-1] < df["high"].iloc[i-2]:
+        return True
+    # 許容：1本切り上げ＋長い上ヒゲ
+    if df["high"].iloc[i-1] > df["high"].iloc[i-2]:
+        return check_short_wick(df.iloc[i-1])
+    return False
+
+def macd_turn_up(df, i):
+    """MACD上向き転換"""
+    if i < 2:
+        return False
+    if MACD_USE_GC_DC:
+        return df["macd"].iloc[i-1] < df["macd_signal"].iloc[i-1] and \
+               df["macd"].iloc[i]   > df["macd_signal"].iloc[i]
+    else:
+        return df["macd"].iloc[i]   > df["macd"].iloc[i-1] and \
+               df["macd"].iloc[i-1] <= df["macd"].iloc[i-2]
+
+def macd_turn_dn(df, i):
+    """MACD下向き転換"""
+    if i < 2:
+        return False
+    if MACD_USE_GC_DC:
+        return df["macd"].iloc[i-1] > df["macd_signal"].iloc[i-1] and \
+               df["macd"].iloc[i]   < df["macd_signal"].iloc[i]
+    else:
+        return df["macd"].iloc[i]   < df["macd"].iloc[i-1] and \
+               df["macd"].iloc[i-1] >= df["macd"].iloc[i-2]
+
+# ══════════════════════════════════════════
+# バックテスト本体
+# ══════════════════════════════════════════
+
+def run_backtest(df):
+    trades = []
+    position = None
+
+    # 状態変数
+    waiting_pullback_long  = False
+    waiting_pullback_short = False
+    pullback_reached_long  = False
+    pullback_reached_short = False
+    spike_ban_count        = 0
+
+    morning_count   = 0
+    afternoon_count = 0
+    last_date       = None
+
+    for i in range(max(MA_LENGTH, MACD_SLOW, BB_LENGTH) + 5, len(df)):
+        row  = df.iloc[i]
+        prev = df.iloc[i-1]
+        current_time = df.index[i]
+        hhmm = get_hhmm(current_time)
+
+        # 日付リセット
+        current_date = to_jst(current_time).date()
+        if current_date != last_date:
+            morning_count   = 0
+            afternoon_count = 0
+            last_date       = current_date
+            waiting_pullback_long  = False
+            waiting_pullback_short = False
+            pullback_reached_long  = False
+            pullback_reached_short = False
+            spike_ban_count        = 0
+
+        # NaN チェック
+        if pd.isna(row["ma"]) or pd.isna(row["macd"]) or pd.isna(row["bb_width"]):
+            continue
+
+        # ── 強制決済 ──────────────────────────
+        if position is not None:
+            if is_force_close_morning(hhmm) or is_force_close_end(hhmm):
+                pnl = _calc_pnl(position, row["close"])
+                _close_position(position, current_time, row["close"], pnl, "⏰ 強制決済", trades)
+                position = None
+                continue
+
+        # 取引時間外はスキップ（ポジション持っていれば強制決済済）
+        if not (is_morning(hhmm) or is_afternoon(hhmm) or is_no_entry(hhmm)):
+            continue
+
+        # ── 相場判定 ──────────────────────────
+        bb_width = row["bb_width"] if row["bb_width"] > 0 else 1
+        slope_val = (row["ma"] - row["ma_prev"]) / bb_width if not pd.isna(row["ma_prev"]) else 0
+
+        is_uptrend   = slope_val >  MA_SLOPE_THRESHOLD and row["close"] > row["ma"]
+        is_downtrend = slope_val < -MA_SLOPE_THRESHOLD and row["close"] < row["ma"]
+        is_range     = (BB_RATIO_MIN <= row["bb_ratio"] <= BB_RATIO_MAX) and \
+                       (abs(slope_val) <= MA_SLOPE_THRESHOLD)
+
+        # 急変判定
+        prev_cross = (prev["close"] > prev["ma"]) != (row["close"] > row["ma"])
+        if prev_cross:
+            spike_ban_count = SPIKE_BAN_BARS
+        elif spike_ban_count > 0:
+            spike_ban_count -= 1
+        is_spike_ban = spike_ban_count > 0
+
+        # ── 保有中：損切り・利確チェック ──────
+        if position is not None:
+            pnl = _calc_pnl(position, row["close"])
+            if pnl >= TP_PT:
+                _close_position(position, current_time, row["close"], pnl, "✅ 利確", trades)
+                _increment_count(position, hhmm, morning_count, afternoon_count)
+                morning_count, afternoon_count = _update_count(position, hhmm, morning_count, afternoon_count)
+                position = None
+                continue
+            elif pnl <= -SL_PT:
+                _close_position(position, current_time, row["close"], pnl, "❌ 損切り", trades)
+                morning_count, afternoon_count = _update_count(position, hhmm, morning_count, afternoon_count)
+                position = None
+                continue
+
+        # 新規エントリー禁止時間
+        if not can_entry(hhmm, morning_count, afternoon_count):
+            continue
+        if is_spike_ban:
+            continue
+        if position is not None:
+            continue
+
+        # ── 形の判定 ──────────────────────────
+        hh3 = higher_highs_3(df, i)
+        ll3 = lower_lows_3(df, i)
+        lows_long  = lows_ok_long(df, i)
+        highs_short = highs_ok_short(df, i)
+
+        # ── 押し待ち状態更新 ──────────────────
+        if hh3 and lows_long and is_uptrend and not is_range:
+            waiting_pullback_long  = True
+            pullback_reached_long  = False
+
+        if ll3 and highs_short and is_downtrend and not is_range:
+            waiting_pullback_short = True
+            pullback_reached_short = False
+
+        # MA近接判定
+        near_ma = abs(row["close"] - row["ma"]) <= MA_PROXIMITY_PT
+
+        if waiting_pullback_long and near_ma:
+            pullback_reached_long = True
+        if waiting_pullback_short and near_ma:
+            pullback_reached_short = True
+
+        # ── エントリーシグナル ────────────────
+
+        # トレンドロング4本目
+        long4 = False
+        if LONG_ENABLED and is_uptrend and not is_range and pullback_reached_long:
+            c1 = (row["close"] > row["open"]) if ENTRY4_BULL_CANDLE else True
+            c2 = (row["close"] > prev["high"]) if ENTRY4_BREAKOUT_H else True
+            c3 = macd_turn_up(df, i) if ENTRY4_MACD_TURN else True
+            long4 = c1 and c2 and c3
+
+        # トレンドショート4本目
+        short4 = False
+        if SHORT_ENABLED and is_downtrend and not is_range and pullback_reached_short:
+            c1 = (row["close"] < row["open"]) if ENTRY4_BULL_CANDLE else True
+            c2 = (row["close"] < prev["low"]) if ENTRY4_BREAKOUT_H else True
+            c3 = macd_turn_dn(df, i) if ENTRY4_MACD_TURN else True
+            short4 = c1 and c2 and c3
+
+        # トレンドロング3本目
+        long3 = False
+        if ENTRY3_ENABLED and LONG_ENABLED and is_uptrend and not is_range and hh3 and lows_long:
+            c1 = (abs(row["close"] - row["ma"]) <= ENTRY3_MAX_DEV) if ENTRY3_COND1 else True
+            c2 = (row["macd"] > 0 and row["macd"] > prev["macd"]) if ENTRY3_COND2 else True
+            c3 = (abs(row["close"] - row["open"]) >= ENTRY3_MIN_BODY) if ENTRY3_COND3 else True
+            c4 = ((df["high"].iloc[i-ENTRY3_SWING_LB:i].max() -
+                   df["low"].iloc[i-ENTRY3_SWING_LB:i].min()) >= ENTRY3_MIN_SWING) if ENTRY3_COND4 else True
+            c5 = (abs(row["close"] - row["ma"]) <= ENTRY3_SHALLOW_PT) if ENTRY3_COND5 else True
+            long3 = row["close"] > row["open"] and c1 and c2 and c3 and c4 and c5
+
+        # トレンドショート3本目
+        short3 = False
+        if ENTRY3_ENABLED and SHORT_ENABLED and is_downtrend and not is_range and ll3 and highs_short:
+            c1 = (abs(row["close"] - row["ma"]) <= ENTRY3_MAX_DEV) if ENTRY3_COND1 else True
+            c2 = (row["macd"] < 0 and row["macd"] < prev["macd"]) if ENTRY3_COND2 else True
+            c3 = (abs(row["close"] - row["open"]) >= ENTRY3_MIN_BODY) if ENTRY3_COND3 else True
+            c4 = ((df["high"].iloc[i-ENTRY3_SWING_LB:i].max() -
+                   df["low"].iloc[i-ENTRY3_SWING_LB:i].min()) >= ENTRY3_MIN_SWING) if ENTRY3_COND4 else True
+            c5 = (abs(row["close"] - row["ma"]) <= ENTRY3_SHALLOW_PT) if ENTRY3_COND5 else True
+            short3 = row["close"] < row["open"] and c1 and c2 and c3 and c4 and c5
+
+        # レンジエントリー
+        range_long  = LONG_ENABLED  and is_range and not is_spike_ban and row["bb_position"] <= RANGE_LONG_THRESH
+        range_short = SHORT_ENABLED and is_range and not is_spike_ban and row["bb_position"] >= RANGE_SHORT_THRESH
+
+        # ── エントリー実行 ────────────────────
+        entry_side   = None
+        entry_type   = None
+        macd_above0  = row["macd"] > 0
+        macd_below0  = row["macd"] < 0
+
+        if long4:
+            entry_side = "long"
+            entry_type = "トレンド4本目" + ("★MACD>0" if macd_above0 else "")
+        elif long3:
+            entry_side = "long"
+            entry_type = "トレンド3本目" + ("★MACD>0" if macd_above0 else "")
+        elif range_long:
+            entry_side = "long"
+            entry_type = "レンジ"
+        elif short4:
+            entry_side = "short"
+            entry_type = "トレンド4本目" + ("★MACD<0" if macd_below0 else "")
+        elif short3:
+            entry_side = "short"
+            entry_type = "トレンド3本目" + ("★MACD<0" if macd_below0 else "")
+        elif range_short:
+            entry_side = "short"
+            entry_type = "レンジ"
+
+        if entry_side is not None:
+            position = {
+                "side":       entry_side,
+                "entry_type": entry_type,
+                "entry_time": current_time,
+                "entry_price": row["close"],
+                "sl":  row["close"] - SL_PT if entry_side == "long" else row["close"] + SL_PT,
+                "tp":  row["close"] + TP_PT if entry_side == "long" else row["close"] - TP_PT,
+            }
+            side_str = "🟢 ロング" if entry_side == "long" else "🔴 ショート"
+            print(f"{side_str} [{entry_type}] "
+                  f"{to_jst(current_time).strftime('%m/%d %H:%M')} "
+                  f"@ {row['close']:.0f}円")
+
+            if entry_side == "long":
+                waiting_pullback_long  = False
+                pullback_reached_long  = False
+            else:
+                waiting_pullback_short = False
+                pullback_reached_short = False
+
+    return trades
+
+# ══════════════════════════════════════════
+# ヘルパー
+# ══════════════════════════════════════════
+
+def _calc_pnl(position, price):
+    if position["side"] == "long":
+        return price - position["entry_price"]
+    else:
+        return position["entry_price"] - price
+
+def _close_position(position, exit_time, exit_price, pnl, result, trades):
+    position.update({
+        "exit_time":  exit_time,
+        "exit_price": exit_price,
+        "pnl":        pnl,
+        "result":     result,
+    })
+    trades.append(dict(position))
+    emoji = "✅" if pnl > 0 else "❌"
+    print(f"  → {result} {emoji} {pnl:+.0f}円 "
+          f"@ {to_jst(exit_time).strftime('%H:%M')}")
+
+def _update_count(position, hhmm, morning_count, afternoon_count):
+    if is_morning(hhmm) or is_force_close_morning(hhmm):
+        morning_count += 1
+    elif is_afternoon(hhmm) or is_no_entry(hhmm):
+        afternoon_count += 1
+    return morning_count, afternoon_count
+
+def _increment_count(position, hhmm, morning_count, afternoon_count):
+    pass  # _update_count で処理
+
+# ══════════════════════════════════════════
+# 結果表示
+# ══════════════════════════════════════════
+
+def show_results(trades):
+    if len(trades) == 0:
+        print("⚠️ トレードなし")
+        return
+
+    df_r = pd.DataFrame(trades)
+    df_r["entry_time_jst"] = pd.to_datetime(df_r["entry_time"]).apply(to_jst)
+    df_r["date"] = df_r["entry_time_jst"].apply(lambda x: x.date())
+
+    total  = len(df_r)
+    wins   = len(df_r[df_r["pnl"] > 0])
+    losses = len(df_r[df_r["pnl"] <= 0])
+    win_rate   = wins / total * 100
+    total_pnl  = df_r["pnl"].sum()
+    daily      = df_r.groupby("date")["pnl"].sum()
+    avg_per_day = total / len(daily)
+
+    print(f"\n{'='*50}")
+    print(f"【総合成績】")
+    print(f"総トレード数: {total}回")
+    print(f"勝ち:         {wins}回")
+    print(f"負け:         {losses}回")
+    print(f"勝率:         {win_rate:.1f}%")
+    print(f"合計損益:     {total_pnl:.0f}円（1株）")
+    print(f"取引日数:     {len(daily)}日")
+    print(f"1日平均:      {avg_per_day:.1f}回")
+    print(f"RR設定:       損切り{SL_PT}円 / 利確{TP_PT}円")
+    print(f"{'='*50}")
+
+    # ── エントリー種別別成績 ────────────────
+    print(f"\n【エントリー種別成績】")
+    for entry_type in df_r["entry_type"].unique():
+        sub = df_r[df_r["entry_type"].str.startswith(entry_type.split("★")[0])]
+        sub_wins = len(sub[sub["pnl"] > 0])
+        sub_total = len(sub)
+        sub_wr = sub_wins / sub_total * 100 if sub_total > 0 else 0
+        sub_pnl = sub["pnl"].sum()
+        print(f"  {entry_type:<18} {sub_total}回 勝率{sub_wr:.0f}% 損益{sub_pnl:+.0f}円")
+
+    # ── ロング/ショート別 ───────────────────
+    print(f"\n【ロング/ショート別成績】")
+    for side in ["long", "short"]:
+        sub = df_r[df_r["side"] == side]
+        if len(sub) == 0:
+            continue
+        sub_wins = len(sub[sub["pnl"] > 0])
+        sub_total = len(sub)
+        sub_wr = sub_wins / sub_total * 100
+        sub_pnl = sub["pnl"].sum()
+        label = "ロング" if side == "long" else "ショート"
+        print(f"  {label}: {sub_total}回 勝率{sub_wr:.0f}% 損益{sub_pnl:+.0f}円")
+
+    # ── 決済理由別 ──────────────────────────
+    print(f"\n【決済理由別】")
+    for result in df_r["result"].unique():
+        sub = df_r[df_r["result"] == result]
+        print(f"  {result}: {len(sub)}回 損益{sub['pnl'].sum():+.0f}円")
+
+    # ── 日別損益 ────────────────────────────
+    print(f"\n【日別損益】")
+    print(daily.to_string())
+
+    # ── 全トレード明細 ──────────────────────
+    print(f"\n【全トレード明細】")
+    cols = ["side", "entry_type", "entry_time_jst", "entry_price",
+            "exit_price", "pnl", "result"]
+    df_r["entry_time_jst"] = df_r["entry_time_jst"].apply(
+        lambda x: x.strftime("%m/%d %H:%M"))
+    print(df_r[cols].to_string(index=False))
+
+# ══════════════════════════════════════════
+# メイン
+# ══════════════════════════════════════════
+
+if __name__ == "__main__":
+    df = get_data()
+    df = calc_indicators(df)
+
+    print("\n" + "="*50)
+    print(f"🚀 日経レバ 15分足 押し目・戻り売り戦略")
+    print(f"   損切り{SL_PT}円 / 利確{TP_PT}円 (RR 1:{TP_PT//SL_PT})")
+    print(f"   ロング={'ON' if LONG_ENABLED else 'OFF'} "
+          f"ショート={'ON' if SHORT_ENABLED else 'OFF'} "
+          f"3本目={'ON' if ENTRY3_ENABLED else 'OFF'}")
+    print("="*50 + "\n")
+
+    trades = run_backtest(df)
+    show_results(trades)
