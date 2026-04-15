@@ -775,8 +775,8 @@ def check_micro_signal(df):
         #     if (not pd.isna(vr) and vr >= 2.0 and
         #             not pd.isna(bw) and not pd.isna(bwm) and bw > bwm):
         #         fired.append("②")
-        # 系統①: 月火水 × 8/12/15/18/19/20/21/23時 × 3月・7月除外
-        if wd in (0, 1, 2) and hr in (8, 12, 15, 18, 19, 20, 21, 23) and month not in (3, 7):
+        # 系統①: 月火水 × 8/12/15/18/19/20/21/23時 × 3月・5月・7月・11月除外
+        if wd in (0, 1, 2) and hr in (8, 12, 15, 18, 19, 20, 21, 23) and month not in (3, 5, 7, 11):
             if micro_monthly_skip:
                 log(f"[系統①] 月次DD制限中のためスキップ ({micro_monthly_pnl:,.0f}円)")
             else:
@@ -790,8 +790,8 @@ def check_micro_signal(df):
     dc       = (row["macd"] < row["macd_sig"])
 
     if below_ma and touch_hi and dc:
-        # 月水木金 × 7月・11月除外
-        if wd in (0, 2, 3, 4) and month not in (7, 11):
+        # 月水木金 × 5月・7月・11月除外
+        if wd in (0, 2, 3, 4) and month not in (5, 7, 11):
             now_dt = dt.to_pydatetime() if hasattr(dt, "to_pydatetime") else dt
 
             # ── 月次DD制限チェック（リセットは check_micro_entry() 先頭で実施）──
