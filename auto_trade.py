@@ -1222,6 +1222,19 @@ def check_micro_entry(now, micro_board):
     if micro_last_signal_bar_time == latest_bar_time:
         return  # 同一確定足で重複判定しない
 
+    # ── セッション跨ぎによる陳腐化足のスキップ ──
+    # 15:40〜17:00 / 5:55〜8:45 のセッション間ギャップ中はバー更新が止まるため、
+    # 次セッション開始時に前セッション最終足（例: 15:35足→hr=15）が
+    # 初めて「確定足」になって17:00頃に評価されてしまう問題を防ぐ。
+    # 確定足の開始から10分以上経過している場合は評価せずにロックする。
+    now_naive = now.replace(tzinfo=None)
+    bar_dt    = pd.Timestamp(latest_bar_time).to_pydatetime()
+    bar_age_min = (now_naive - bar_dt).total_seconds() / 60
+    if bar_age_min > 10:
+        micro_last_signal_bar_time = latest_bar_time  # ロック（再評価しない）
+        log(f"[MICRO] 陳腐化足スキップ: {bar_dt.strftime('%H:%M')} ({bar_age_min:.0f}分前) → 評価対象外")
+        return
+
     micro_last_signal_bar_time = latest_bar_time
 
     # ── インジケーターウォームアップ中はエントリースキップ ──
