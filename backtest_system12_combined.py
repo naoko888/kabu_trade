@@ -193,6 +193,7 @@ def build_masks(dts_ns: np.ndarray, cpi_df: pd.DataFrame) -> tuple:
 def run_backtest(df: pd.DataFrame,
                  cpi_df: pd.DataFrame,
                  s1_excl_months=(3, 7),
+                 s3_excl_months=None,
                  s3_po: bool = False,
                  use_ma_dist=False,
                  use_entry_limit=False,
@@ -227,7 +228,7 @@ def run_backtest(df: pd.DataFrame,
     dst_mask, cpi_mask = build_masks(dts_ns, cpi_df if cpi_df is not None else pd.DataFrame(columns=["release_datetime_jst"]))
 
     s1_excl_set = set(s1_excl_months)
-    s3_excl_set = set(S3_EXCL_MONTHS)
+    s3_excl_set = set(S3_EXCL_MONTHS) if s3_excl_months is None else set(s3_excl_months)
 
     trades = []
 
@@ -790,6 +791,396 @@ def main():
 
         for y, m in ym_list:
             print(f"  {y}-{str(m).zfill(2)}")
-     
+
+    # =========================
+    # 除外月分析（系統①③）
+    # =========================
+    print_scenario_header("【除外月分析】系統① 除外月（3/5/7/11月）の成績")
+
+    # 除外月なしで再BT
+    trades_all = run_backtest(df, cpi, s1_excl_months=())
+    t1_excl = trades_all[
+        (trades_all["system"] == "①") &
+        (trades_all["signal_month"].isin([3, 5, 7, 11]))
+    ].copy()
+
+    # 月別
+    print("\n  [月別]")
+    print(f"  {'月':>4}  {'件数':>5}  {'勝率%':>6}  {'損益(円)':>11}  {'PF':>6}")
+    print("  " + "-" * 45)
+    for mo in [3, 5, 7, 11]:
+        grp = t1_excl[t1_excl["signal_month"] == mo]
+        s = calc_summary(grp)
+        print(f"  {mo:>3}月  {s['n']:>5}  {s['win_rate']:>5.1f}%  {s['pnl_yen']:>+11,.0f}  {pf_str(s['pf'])}")
+
+    # 曜日別
+    print("\n  [曜日別]")
+    day_names = {0:"月曜", 1:"火曜", 2:"水曜", 3:"木曜", 4:"金曜"}
+    print(f"  {'曜日':>4}  {'件数':>5}  {'勝率%':>6}  {'損益(円)':>11}  {'PF':>6}")
+    print("  " + "-" * 45)
+    for wd in [0, 1, 2]:
+        grp = t1_excl[t1_excl["signal_weekday"] == wd]
+        s = calc_summary(grp)
+        print(f"  {day_names[wd]}  {s['n']:>5}  {s['win_rate']:>5.1f}%  {s['pnl_yen']:>+11,.0f}  {pf_str(s['pf'])}")
+
+    # 時間帯別
+    print("\n  [時間帯別]")
+    print(f"  {'時間':>4}  {'件数':>5}  {'勝率%':>6}  {'損益(円)':>11}  {'PF':>6}")
+    print("  " + "-" * 45)
+    for hr in sorted(t1_excl["signal_hour"].unique()):
+        grp = t1_excl[t1_excl["signal_hour"] == hr]
+        s = calc_summary(grp)
+        print(f"  {hr:>3}時  {s['n']:>5}  {s['win_rate']:>5.1f}%  {s['pnl_yen']:>+11,.0f}  {pf_str(s['pf'])}")
+
+    # 年別
+    print("\n  [年別]")
+    print(f"  {'年':>4}  {'件数':>5}  {'勝率%':>6}  {'損益(円)':>11}  {'PF':>6}")
+    print("  " + "-" * 45)
+    for yr in sorted(t1_excl["signal_year"].unique()):
+        grp = t1_excl[t1_excl["signal_year"] == yr]
+        s = calc_summary(grp)
+        print(f"  {yr}  {s['n']:>5}  {s['win_rate']:>5.1f}%  {s['pnl_yen']:>+11,.0f}  {pf_str(s['pf'])}")
+
+    # 7月 年別詳細
+    t1_jul = t1_excl[t1_excl["signal_month"] == 7]
+    if not t1_jul.empty:
+        print("\n  [7月 年別詳細]")
+        print(f"  {'年':>4}  {'件数':>5}  {'勝率%':>6}  {'損益(円)':>11}  {'PF':>6}")
+        print("  " + "-" * 45)
+        for yr in sorted(t1_jul["signal_year"].unique()):
+            grp = t1_jul[t1_jul["signal_year"] == yr]
+            s = calc_summary(grp)
+            print(f"  {yr}  {s['n']:>5}  {s['win_rate']:>5.1f}%  {s['pnl_yen']:>+11,.0f}  {pf_str(s['pf'])}")
+
+        print("\n  [7月 DD分析]")
+        for yr in sorted(t1_jul["signal_year"].unique()):
+            grp = t1_jul[t1_jul["signal_year"] == yr].copy()
+            grp = grp.sort_values("signal_dt")
+
+            grp["cum"]  = grp["pnl_yen"].cumsum()
+            grp["peak"] = grp["cum"].cummax()
+            grp["dd"]   = grp["cum"] - grp["peak"]
+
+            max_dd  = grp["dd"].min()
+            dd_idx  = grp["dd"].idxmin()
+            dd_time = grp.loc[dd_idx, "signal_dt"].strftime("%Y-%m-%d %H:%M")
+
+            loss    = grp["pnl_yen"] < 0
+            streak  = (loss != loss.shift()).cumsum()
+            max_losing_streak = int(loss.groupby(streak).sum().max()) if loss.any() else 0
+
+            print(f"  {yr}  最大DD: {max_dd:,.0f}円  発生日: {dd_time}  最大連敗: {max_losing_streak}")
+
+
+    print_scenario_header("【除外月分析】系統③ 除外月（5/7/11月）の成績")
+
+    # 系統③用：除外月なし（5/7/11月をBTに含める）で再BT
+    trades_all3 = run_backtest(df, cpi, s1_excl_months=(), s3_excl_months=())
+    t3_excl = trades_all3[
+        (trades_all3["system"] == "③") &
+        (trades_all3["signal_month"].isin([5, 7, 11]))
+    ].copy()
+
+    # 月別
+    print("\n  [月別]")
+    print(f"  {'月':>4}  {'件数':>5}  {'勝率%':>6}  {'損益(円)':>11}  {'PF':>6}")
+    print("  " + "-" * 45)
+    for mo in [5, 7, 11]:
+        grp = t3_excl[t3_excl["signal_month"] == mo]
+        s = calc_summary(grp)
+        print(f"  {mo:>3}月  {s['n']:>5}  {s['win_rate']:>5.1f}%  {s['pnl_yen']:>+11,.0f}  {pf_str(s['pf'])}")
+
+    # 曜日別
+    print("\n  [曜日別]")
+    print(f"  {'曜日':>4}  {'件数':>5}  {'勝率%':>6}  {'損益(円)':>11}  {'PF':>6}")
+    print("  " + "-" * 45)
+    for wd in [0, 2, 3, 4]:
+        grp = t3_excl[t3_excl["signal_weekday"] == wd]
+        s = calc_summary(grp)
+        print(f"  {day_names[wd]}  {s['n']:>5}  {s['win_rate']:>5.1f}%  {s['pnl_yen']:>+11,.0f}  {pf_str(s['pf'])}")
+
+    # 時間帯別
+    print("\n  [時間帯別]")
+    print(f"  {'時間':>4}  {'件数':>5}  {'勝率%':>6}  {'損益(円)':>11}  {'PF':>6}")
+    print("  " + "-" * 45)
+    for hr in sorted(t3_excl["signal_hour"].unique()):
+        grp = t3_excl[t3_excl["signal_hour"] == hr]
+        s = calc_summary(grp)
+        print(f"  {hr:>3}時  {s['n']:>5}  {s['win_rate']:>5.1f}%  {s['pnl_yen']:>+11,.0f}  {pf_str(s['pf'])}")
+
+    # 年別
+    print("\n  [年別]")
+    print(f"  {'年':>4}  {'件数':>5}  {'勝率%':>6}  {'損益(円)':>11}  {'PF':>6}")
+    print("  " + "-" * 45)
+    for yr in sorted(t3_excl["signal_year"].unique()):
+        grp = t3_excl[t3_excl["signal_year"] == yr]
+        s = calc_summary(grp)
+        print(f"  {yr}  {s['n']:>5}  {s['win_rate']:>5.1f}%  {s['pnl_yen']:>+11,.0f}  {pf_str(s['pf'])}")
+
+    # 7月 年別詳細
+    t3_jul = t3_excl[t3_excl["signal_month"] == 7]
+    if not t3_jul.empty:
+        print("\n  [7月 年別詳細]")
+        print(f"  {'年':>4}  {'件数':>5}  {'勝率%':>6}  {'損益(円)':>11}  {'PF':>6}")
+        print("  " + "-" * 45)
+        for yr in sorted(t3_jul["signal_year"].unique()):
+            grp = t3_jul[t3_jul["signal_year"] == yr]
+            s = calc_summary(grp)
+            print(f"  {yr}  {s['n']:>5}  {s['win_rate']:>5.1f}%  {s['pnl_yen']:>+11,.0f}  {pf_str(s['pf'])}")
+
+    # =========================
+    # 系統① DST影響分析
+    # =========================
+    # 通常月（除外月以外）の系統① を trades（シナリオA: s1_excl=(3,5,7,11)）から取得
+    t1_normal = trades[
+        (trades["system"] == "①") &
+        (~trades["signal_month"].isin([3, 5, 7, 11]))
+    ].copy()
+    t1_normal = _add_dst_col(t1_normal)
+    t1_normal_dst = t1_normal[t1_normal["is_dst"]]
+    t1_normal_win = t1_normal[~t1_normal["is_dst"]]
+
+    print_scenario_header("【DST影響分析】系統① 通常月（3/5/7/11月除外） DST vs 冬時間")
+    _print_dst_hour_table(t1_normal_dst, t1_normal_win)
+
+    # 7月のみ（trades_all = s1_excl=() で取得済み）
+    t1_jul_dst_ana = _add_dst_col(t1_jul)
+    t1_jul_dst = t1_jul_dst_ana[t1_jul_dst_ana["is_dst"]]
+    t1_jul_win = t1_jul_dst_ana[~t1_jul_dst_ana["is_dst"]]
+
+    print_scenario_header("【DST影響分析】系統① 7月のみ DST vs 冬時間")
+    _print_dst_hour_table(t1_jul_dst, t1_jul_win)
+
+    # =========================
+    # 系統① DST/冬時間別 推奨時間帯まとめ
+    # =========================
+    print_scenario_header("【時間帯最適化】系統① 推奨時間帯（PF>=1.0 を○、<1.0 を✗、件数0を-）")
+
+    S1_ALL_HOURS = (8, 12, 15, 18, 19, 20, 21, 23)
+    DAY_H   = (8, 12, 15)
+    NIGHT_H = (18, 19, 20, 21, 23)
+
+    def _hour_rec(dst_df, win_df, hours, section_label):
+        print(f"\n  {section_label}")
+        print(
+            f"  {'時間':>4}  "
+            f"{'DST件数':>7}  {'DST勝率%':>8}  {'DST損益(円)':>12}  {'DST PF':>7}  {'DST':>4}  │  "
+            f"{'冬件数':>6}  {'冬勝率%':>7}  {'冬損益(円)':>12}  {'冬PF':>6}  {'冬':>4}"
+        )
+        print("  " + "-" * 100)
+        for hr in hours:
+            d  = dst_df[dst_df["signal_hour"] == hr]
+            w  = win_df[win_df["signal_hour"] == hr]
+            sd = calc_summary(d)
+            sw = calc_summary(w)
+            d_mark = "-" if sd["n"] == 0 else ("○" if sd["pf"] >= 1.0 else "✗")
+            w_mark = "-" if sw["n"] == 0 else ("○" if sw["pf"] >= 1.0 else "✗")
+            print(
+                f"  {hr:>3}時  "
+                f"{sd['n']:>7}  {sd['win_rate']:>7.1f}%  {sd['pnl_yen']:>+12,.0f}  {pf_str(sd['pf']):>7}  {d_mark:>4}  │  "
+                f"{sw['n']:>6}  {sw['win_rate']:>6.1f}%  {sw['pnl_yen']:>+12,.0f}  {pf_str(sw['pf']):>6}  {w_mark:>4}"
+            )
+
+    print("\n■ 通常月（3/5/7/11月除外）")
+    _hour_rec(t1_normal_dst, t1_normal_win, DAY_H,   "─日中─")
+    _hour_rec(t1_normal_dst, t1_normal_win, NIGHT_H, "─夜間─")
+
+    print("\n■ 7月")
+    _hour_rec(t1_jul_dst, t1_jul_win, DAY_H,   "─日中─")
+    _hour_rec(t1_jul_dst, t1_jul_win, NIGHT_H, "─夜間─")
+
+    # 推奨時間帯サマリー
+    print("\n■ 推奨時間帯サマリー（通常月ベース PF>=1.0）")
+    dst_keep = [hr for hr in S1_ALL_HOURS
+                if calc_summary(t1_normal_dst[t1_normal_dst["signal_hour"] == hr])["pf"] >= 1.0
+                and calc_summary(t1_normal_dst[t1_normal_dst["signal_hour"] == hr])["n"] > 0]
+    win_keep = [hr for hr in S1_ALL_HOURS
+                if calc_summary(t1_normal_win[t1_normal_win["signal_hour"] == hr])["pf"] >= 1.0
+                and calc_summary(t1_normal_win[t1_normal_win["signal_hour"] == hr])["n"] > 0]
+    print(f"  DST期間 推奨時間帯: {dst_keep}")
+    print(f"  冬時間  推奨時間帯: {win_keep}")
+    common = sorted(set(dst_keep) & set(win_keep))
+    dst_only = sorted(set(dst_keep) - set(win_keep))
+    win_only = sorted(set(win_keep) - set(dst_keep))
+    print(f"  共通（両期間○）: {common}")
+    print(f"  DSTのみ○:       {dst_only}")
+    print(f"  冬時間のみ○:    {win_only}")
+
+    # =========================
+    # 系統① DST版 vs 現行 比較
+    # =========================
+    # DST版時間帯定義
+    S1_DST_HOURS_NEW = [8, 15, 18, 19, 20, 21]
+    S1_WIN_HOURS_NEW = [8, 12, 15, 18, 20, 21, 23]
+
+    # trades_all（除外月なし）の system① に DST フラグを付与
+    t1_all = trades_all[trades_all["system"] == "①"].copy()
+    t1_all = _add_dst_col(t1_all)
+
+    # DST版: DST期間は S1_DST_HOURS_NEW、冬時間は S1_WIN_HOURS_NEW でフィルタ
+    # さらに除外月（3,5,7,11）を適用して現行と比較条件を揃える
+    t1_dst_ver = t1_all[
+        (
+            (t1_all["is_dst"]  & t1_all["signal_hour"].isin(S1_DST_HOURS_NEW)) |
+            (~t1_all["is_dst"] & t1_all["signal_hour"].isin(S1_WIN_HOURS_NEW))
+        ) &
+        (~t1_all["signal_month"].isin([3, 5, 7, 11]))
+    ].copy()
+
+    # 現行: trades（シナリオA: s1_excl=(3,5,7,11)）の system①
+    t1_current = trades[trades["system"] == "①"].copy()
+
+    s_cur = calc_summary(t1_current)
+    s_dst = calc_summary(t1_dst_ver)
+
+    # ③ 7月除外なしDST版: excl=(3,5,11)、t1_all は除外月なし（7月含む）
+    t1_no7_dst_ver = t1_all[
+        (
+            (t1_all["is_dst"]  & t1_all["signal_hour"].isin(S1_DST_HOURS_NEW)) |
+            (~t1_all["is_dst"] & t1_all["signal_hour"].isin(S1_WIN_HOURS_NEW))
+        ) &
+        (~t1_all["signal_month"].isin([3, 5, 11]))
+    ].copy()
+
+    s_cur = calc_summary(t1_current)
+    s_dst = calc_summary(t1_dst_ver)
+    s_no7 = calc_summary(t1_no7_dst_ver)
+
+    print_scenario_header("【系統① 比較】現行 / DST版 / 7月除外なしDST版")
+
+    # --- 全体比較 ---
+    print(f"\n  {'':12}  {'件数':>6}  {'勝率%':>6}  {'損益(円)':>12}  {'PF':>7}")
+    print("  " + "-" * 55)
+    print(f"  {'①現行':12}  {s_cur['n']:>6}  {s_cur['win_rate']:>5.1f}%  {s_cur['pnl_yen']:>+12,.0f}  {pf_str(s_cur['pf']):>7}")
+    print(f"  {'②DST版':12}  {s_dst['n']:>6}  {s_dst['win_rate']:>5.1f}%  {s_dst['pnl_yen']:>+12,.0f}  {pf_str(s_dst['pf']):>7}")
+    d2n  = s_dst['n'] - s_cur['n']
+    d2p  = s_dst['pnl_yen'] - s_cur['pnl_yen']
+    d2pf = round(s_dst['pf'] - s_cur['pf'], 3)
+    print(f"  {'  差分(②-①)':12}  {d2n:>+6}  {'---':>6}   {d2p:>+12,.0f}  {d2pf:>+7.3f}")
+    print(f"  {'③7月込みDST':12}  {s_no7['n']:>6}  {s_no7['win_rate']:>5.1f}%  {s_no7['pnl_yen']:>+12,.0f}  {pf_str(s_no7['pf']):>7}")
+    d3n  = s_no7['n'] - s_cur['n']
+    d3p  = s_no7['pnl_yen'] - s_cur['pnl_yen']
+    d3pf = round(s_no7['pf'] - s_cur['pf'], 3)
+    print(f"  {'  差分(③-①)':12}  {d3n:>+6}  {'---':>6}   {d3p:>+12,.0f}  {d3pf:>+7.3f}")
+
+    print(f"\n  時間帯定義: DST={S1_DST_HOURS_NEW}  冬={S1_WIN_HOURS_NEW}")
+
+    # --- 年別成績 ---
+    print("\n  [年別成績]")
+    print(f"  {'年':>4}  {'現行損益':>11}  {'現行PF':>7}  │  {'DST版損益':>11}  {'DST版PF':>8}  │  {'7月込み損益':>11}  {'7月込みPF':>9}")
+    print("  " + "-" * 85)
+    all_years = sorted(
+        set(t1_current["signal_year"].unique()) |
+        set(t1_dst_ver["signal_year"].unique()) |
+        set(t1_no7_dst_ver["signal_year"].unique())
+    )
+    for yr in all_years:
+        sc = calc_summary(t1_current[t1_current["signal_year"] == yr])
+        sd = calc_summary(t1_dst_ver[t1_dst_ver["signal_year"] == yr])
+        sn = calc_summary(t1_no7_dst_ver[t1_no7_dst_ver["signal_year"] == yr])
+        print(
+            f"  {yr}  {sc['pnl_yen']:>+11,.0f}  {pf_str(sc['pf']):>7}  │"
+            f"  {sd['pnl_yen']:>+11,.0f}  {pf_str(sd['pf']):>8}  │"
+            f"  {sn['pnl_yen']:>+11,.0f}  {pf_str(sn['pf']):>9}"
+        )
+
+    # --- 7月のみ ---
+    t1c_jul = t1_current[t1_current["signal_month"] == 7]
+    t1d_jul = t1_dst_ver[t1_dst_ver["signal_month"] == 7]
+    t1n_jul = t1_no7_dst_ver[t1_no7_dst_ver["signal_month"] == 7]
+    print("\n  [7月のみ]")
+    print(f"  {'':12}  {'件数':>6}  {'勝率%':>6}  {'損益(円)':>12}  {'PF':>7}")
+    print("  " + "-" * 55)
+    for lbl, grp in [("①現行", t1c_jul), ("②DST版", t1d_jul), ("③7月込みDST", t1n_jul)]:
+        s = calc_summary(grp)
+        print(f"  {lbl:12}  {s['n']:>6}  {s['win_rate']:>5.1f}%  {s['pnl_yen']:>+12,.0f}  {pf_str(s['pf']):>7}")
+
+    # ④⑤ ③7月込みDST版 に月次DD制限を適用
+    print_scenario_header("【系統① 月次DD制限比較】③7月込みDST版 へのDD制限適用")
+
+    for lim_label, lim in [("-30,000円", -30_000), ("-40,000円", -40_000)]:
+        res     = sim_monthly_dd(t1_no7_dst_ver, lim)
+        active  = res["active"]
+        skipped = res["skipped"]
+        months_triggered = res["months_triggered"]
+        s_dd    = calc_summary(active)
+
+        # 発動月リストを再計算（sim_monthly_dd は triggered set を返さないため）
+        df_tmp = t1_no7_dst_ver.sort_values("signal_dt").copy()
+        df_tmp["ym"] = list(zip(df_tmp["signal_year"], df_tmp["signal_month"]))
+        month_pnl_tmp  = {}
+        triggered_months = []
+        triggered_set  = set()
+        for _, row in df_tmp.iterrows():
+            ym = row["ym"]
+            if ym not in month_pnl_tmp:
+                month_pnl_tmp[ym] = 0.0
+            if ym in triggered_set:
+                continue
+            month_pnl_tmp[ym] += row["pnl_yen"]
+            if month_pnl_tmp[ym] <= lim:
+                triggered_set.add(ym)
+                triggered_months.append(ym)
+
+        jul_triggered = any(m == 7 for _, m in triggered_months)
+
+        print(f"\n  ③ + 月次DD {lim_label}")
+        print(f"  {'':12}  {'件数':>6}  {'勝率%':>6}  {'損益(円)':>12}  {'PF':>7}")
+        print("  " + "-" * 55)
+        print(f"  {'③ベース':12}  {s_no7['n']:>6}  {s_no7['win_rate']:>5.1f}%  {s_no7['pnl_yen']:>+12,.0f}  {pf_str(s_no7['pf']):>7}")
+        print(f"  {'DD制限後':12}  {s_dd['n']:>6}  {s_dd['win_rate']:>5.1f}%  {s_dd['pnl_yen']:>+12,.0f}  {pf_str(s_dd['pf']):>7}")
+        print(f"  スキップ: {skipped}件  発動月: {months_triggered}ヶ月  7月発動: {'あり' if jul_triggered else 'なし'}")
+        print(f"  発動月リスト: {sorted(triggered_months)}")
+
+
+def _add_dst_col(df: pd.DataFrame) -> pd.DataFrame:
+    """signal_dt から DST フラグ列を追加する。
+    build_masks() と完全同一ロジック（dts_ns nanosecond 比較）を使用。
+    """
+    df = df.copy()
+    dts_ns = pd.to_datetime(df["signal_dt"]).values.astype("int64")
+    dst_mask = np.zeros(len(dts_ns), dtype=bool)
+    for start, end in _DST_PERIODS:
+        s_ns = start.value
+        e_ns = end.value
+        dst_mask |= (dts_ns >= s_ns) & (dts_ns <= e_ns)
+    df["is_dst"] = dst_mask
+    return df
+
+
+def _print_dst_hour_table(dst_df: pd.DataFrame, win_df: pd.DataFrame):
+    """時間帯別 DST/冬時間 比較テーブルを出力（日中・夜間セクション分け）"""
+    all_hours = sorted(
+        set(dst_df["signal_hour"].unique()) | set(win_df["signal_hour"].unique())
+    )
+    day_hours   = [h for h in all_hours if h in (8, 12, 15)]
+    night_hours = [h for h in all_hours if h in (18, 19, 20, 21, 23)]
+
+    header = (
+        f"  {'時間':>4}  "
+        f"{'件数(DST)':>9}  {'勝率%':>6}  {'損益(円)':>11}  {'PF':>6}  │  "
+        f"{'件数(冬)':>8}  {'勝率%':>6}  {'損益(円)':>11}  {'PF':>6}"
+    )
+    sep = "  " + "-" * 88
+
+    for label, hours in [("  ─日中─", day_hours), ("  ─夜間─", night_hours)]:
+        if not hours:
+            continue
+        print(label)
+        print(header)
+        print(sep)
+        for hr in hours:
+            d  = dst_df[dst_df["signal_hour"] == hr]
+            w  = win_df[win_df["signal_hour"] == hr]
+            sd = calc_summary(d)
+            sw = calc_summary(w)
+            print(
+                f"  {hr:>3}時  "
+                f"{sd['n']:>9}  {sd['win_rate']:>5.1f}%  {sd['pnl_yen']:>+11,.0f}  {pf_str(sd['pf'])}"
+                f"  │  "
+                f"{sw['n']:>8}  {sw['win_rate']:>5.1f}%  {sw['pnl_yen']:>+11,.0f}  {pf_str(sw['pf'])}"
+            )
+
+
 if __name__ == "__main__":
     main()
