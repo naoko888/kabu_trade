@@ -5,7 +5,7 @@ backtest_system12_combined.py
 auto_trade.py の DST / CPI / 時間条件を完全反映済み
 
 ■ 出力構成
-  [A] シナリオ1: 系統① (3月・7月除外) ＋ 系統③ (DST/CPI込み)
+  [A] シナリオ1: 系統① (3月・7月) ＋ 系統③ (DST/CPI込み)
   [B] シナリオ2: 系統① (3・7・11月除外) ＋ 系統③ (同上)
   [C] backtest_perfect_order.py 比較
       系統③ 現行2線(ma9<ma20) vs 完全PO3線(ma9<ma20<ma55)
@@ -36,18 +36,23 @@ TOUCH_PCT      = 0.005
 COMMISSION_PT  = 2.2
 PT_TO_YEN      = 10
 
-SESSION_BOUNDARIES = frozenset({1540, 600, 2350})
+SESSION_BOUNDARIES = frozenset({2350})
 
 # 系統① 条件
 S1_WEEKDAYS   = (0, 1, 2)        # 月・火・水
 S1_HOURS      = (8, 12, 15, 18, 19, 20, 21, 23)
-S1_EXCL_BASE  = (3, 7)           # 3月・7月除外
+S1_EXCL_BASE  = (3, 5, 7, 11)
 
-# 系統③ 条件
-S3_WEEKDAYS   = (0, 2, 3, 4)     # 月・水・木・金
-S3_EXCL_MONTHS = (7, 11)
-S3_HOURS_DST  = (5, 8, 12, 14, 15, 19, 20, 22, 23)
-S3_HOURS_WIN  = (5, 12, 15, 19, 20, 21, 22, 23)
+# 系統③ 条件（backtest_perfect_order.py パターン⑤ 準拠）
+# 時刻: bar START hour（+5min シフトなし）
+# 曜日: s_strong_weekdays（commission=0 EV>0 n>=100）= 月・水・木・金
+# 除外月: 5月・7月・11月
+# 時間帯: DST/冬時間で分岐（bar START hour 基準）
+# CPI除外: 有効（発表前30分〜後60分）
+S3_WEEKDAYS    = (0, 2, 3, 4)     # 月・水・木・金
+S3_EXCL_MONTHS = (5, 7, 11)        # 5月・7月・11月除外
+S3_HOURS_DST   = (5, 8, 12, 14, 15, 19, 20, 22, 23)  # DST期間 bar START hour
+S3_HOURS_WIN   = (5, 12, 15, 19, 20, 21, 22, 23)      # 冬時間  bar START hour
 
 # 米国サマータイム期間
 _DST_PERIODS = [
@@ -123,10 +128,18 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["ma10"] = df["close"].rolling(10).mean()
     df["ma20"] = df["close"].rolling(20).mean()
     df["ma55"] = df["close"].rolling(55).mean()
+
     ema_fast       = df["close"].ewm(span=12, adjust=False).mean()
     ema_slow       = df["close"].ewm(span=26, adjust=False).mean()
     df["macd"]     = ema_fast - ema_slow
     df["macd_sig"] = df["macd"].ewm(span=9, adjust=False).mean()
+
+    # ===== BB追加 =====
+    df["bb_mid"] = df["close"].rolling(20).mean()
+    df["bb_std"] = df["close"].rolling(20).std()
+    df["bb_up"]  = df["bb_mid"] + 2 * df["bb_std"]
+    df["bb_low"] = df["bb_mid"] - 2 * df["bb_std"]
+
     return df
 
 
@@ -180,7 +193,10 @@ def build_masks(dts_ns: np.ndarray, cpi_df: pd.DataFrame) -> tuple:
 def run_backtest(df: pd.DataFrame,
                  cpi_df: pd.DataFrame,
                  s1_excl_months=(3, 7),
-                 s3_po: bool = False) -> pd.DataFrame:
+                 s3_po: bool = False,
+                 use_ma_dist=False,
+                 use_entry_limit=False,
+                 ma_dist_th: float = 0.003) -> pd.DataFrame:
     """
     s1_excl_months: system ① excluded months
     s3_po: if True, use 3-line PO (ma9<ma20<ma55) for system ③
@@ -202,38 +218,56 @@ def run_backtest(df: pd.DataFrame,
     arr_weekday = dts.dt.weekday.values
     arr_month   = dts.dt.month.values
     arr_hm      = arr_hour * 100 + arr_minute
-    dts_ns      = dts.values.astype("int64")
     dt_list     = dts.to_list()
+    dts_ns      = dts.values.astype("int64")
 
     n = len(df)
 
-    # Pre-compute DST / CPI masks
-    dst_mask, cpi_mask = build_masks(dts_ns, cpi_df)
+    # DST / CPI マスク（CPI除外はパターン⑤と同じ条件）
+    dst_mask, cpi_mask = build_masks(dts_ns, cpi_df if cpi_df is not None else pd.DataFrame(columns=["release_datetime_jst"]))
 
     s1_excl_set = set(s1_excl_months)
     s3_excl_set = set(S3_EXCL_MONTHS)
 
     trades = []
 
-    for i in range(2, n - 1):
-        ma9  = arr_ma9[i];  ma10 = arr_ma10[i]
-        ma20 = arr_ma20[i]; ma55 = arr_ma55[i]
-        macd = arr_macd[i]; msig = arr_msig[i]
+    # ←ここに入れる
+    last_entry_i = -999
+    position_bars = 0
+
+    for i in range(3, n):
+        sig_i = i - 1
+        ent_i = i
+
+        # ★ここに追加
+        if position_bars > 0:
+            position_bars += 1
+            if position_bars > 5:
+                position_bars = 0
+
+        ma9  = arr_ma9[sig_i];  ma10 = arr_ma10[sig_i]
+        ma20 = arr_ma20[sig_i]; ma55 = arr_ma55[sig_i]
+        macd = arr_macd[sig_i]; msig = arr_msig[sig_i]
 
         if any(np.isnan(v) for v in [ma9, ma10, ma20, ma55, macd, msig]):
             continue
 
-        hr = (arr_hour[i] * 60 + arr_minute[i] + 5) // 60 % 24
-        wd = arr_weekday[i]
-        mo = arr_month[i]
-        lo = arr_low[i]
-        hi = arr_high[i]
+        hr    = (arr_hour[sig_i] * 60 + arr_minute[sig_i] + 5) // 60 % 24  # 系統①用（bar END hour）
+        h_raw = arr_hour[sig_i]                                               # 系統③用（bar START hour）
+        wd = arr_weekday[sig_i]
+        mo = arr_month[sig_i]
+        lo = arr_low[sig_i]
+        hi = arr_high[sig_i]
+
+        entry_ok = True
+        if use_entry_limit:
+            entry_ok = (position_bars == 0)
 
         # ─── 系統① ───
         if wd in S1_WEEKDAYS and hr in S1_HOURS and mo not in s1_excl_set:
-            ma9p  = arr_ma9[i-1];  ma10p  = arr_ma10[i-1]
-            ma9p2 = arr_ma9[i-2];  ma10p2 = arr_ma10[i-2]
-            c1    = arr_close[i-1]; c2    = arr_close[i-2]
+            ma9p  = arr_ma9[sig_i-1];  ma10p  = arr_ma10[sig_i-1]
+            ma9p2 = arr_ma9[sig_i-2];  ma10p2 = arr_ma10[sig_i-2]
+            c1    = arr_close[sig_i-1]; c2    = arr_close[sig_i-2]
 
             if any(np.isnan(v) for v in [ma9p, ma10p, ma9p2, ma10p2]):
                 pass
@@ -243,15 +277,19 @@ def run_backtest(df: pd.DataFrame,
                          abs(lo - ma10) / ma10 <= TOUCH_PCT)
                 gc    = (macd > msig)
 
-                if above and touch and gc:
-                    ep = arr_open[i + 1]
+                ma_dist_ok = True
+                if use_ma_dist:
+                    ma_dist_ok = abs(arr_close[sig_i] - arr_ma20[sig_i]) / arr_ma20[sig_i] <= ma_dist_th
+
+                if above and touch and gc and ma_dist_ok and entry_ok:
+                    ep = arr_open[ent_i]
                     pnl, rtype = _exec(arr_high, arr_low, arr_close, arr_hm,
-                                       ep, i + 1, "long", n)
+                                       ep, ent_i, "long", n)
                     pnl -= COMMISSION_PT
                     trades.append({
                         "system":        "①",
-                        "signal_dt":     dt_list[i],
-                        "signal_year":   dt_list[i].year,
+                        "signal_dt":     dt_list[sig_i],
+                        "signal_year":   dt_list[sig_i].year,
                         "signal_month":  mo,
                         "signal_hour":   hr,
                         "signal_weekday": wd,
@@ -259,11 +297,18 @@ def run_backtest(df: pd.DataFrame,
                         "pnl_yen":       round(pnl * PT_TO_YEN, 0),
                         "result":        rtype,
                     })
+                    position_bars = 1
+
+        ma_dist_ok = True
+        if use_ma_dist:
+            ma_dist_ok = abs(arr_close[sig_i] - arr_ma20[sig_i]) / arr_ma20[sig_i] <= ma_dist_th
 
         # ─── 系統③ ───
-        if wd in S3_WEEKDAYS and mo not in s3_excl_set and not cpi_mask[i]:
-            s3_hours = S3_HOURS_DST if dst_mask[i] else S3_HOURS_WIN
-            if hr in s3_hours:
+        # bar START hour で判定（backtest_perfect_order.py パターン⑤ 準拠）
+        # DST対応時間帯フィルター + CPI除外（s_strong_weekdays = 月・木）
+        if wd in S3_WEEKDAYS and mo not in s3_excl_set and not cpi_mask[sig_i]:
+            s3_hours = S3_HOURS_DST if dst_mask[sig_i] else S3_HOURS_WIN
+            if h_raw in s3_hours:
                 if s3_po:
                     below = (ma9 < ma20 < ma55)
                 else:
@@ -271,15 +316,17 @@ def run_backtest(df: pd.DataFrame,
                 touch_hi = (abs(hi - ma9) / ma9 <= TOUCH_PCT)
                 dc       = (macd < msig)
 
-                if below and touch_hi and dc:
-                    ep = arr_open[i + 1]
+                if below and touch_hi and dc and ma_dist_ok and entry_ok:
+                    ep = arr_open[ent_i]
                     pnl, rtype = _exec(arr_high, arr_low, arr_close, arr_hm,
-                                       ep, i + 1, "short", n)
+                                       ep, ent_i, "short", n,
+                                       force_session_close=False,  # パターン⑤準拠: セッション境界強制決済なし
+                                       max_hold=50)                # パターン⑤準拠: 最大保有50本
                     pnl -= COMMISSION_PT
                     trades.append({
                         "system":        "③",
-                        "signal_dt":     dt_list[i],
-                        "signal_year":   dt_list[i].year,
+                        "signal_dt":     dt_list[sig_i],
+                        "signal_year":   dt_list[sig_i].year,
                         "signal_month":  mo,
                         "signal_hour":   hr,
                         "signal_weekday": wd,
@@ -287,6 +334,8 @@ def run_backtest(df: pd.DataFrame,
                         "pnl_yen":       round(pnl * PT_TO_YEN, 0),
                         "result":        rtype,
                     })
+                    position_bars = 1
+            
 
     if not trades:
         return pd.DataFrame()
@@ -294,13 +343,18 @@ def run_backtest(df: pd.DataFrame,
 
 
 def _exec(arr_high, arr_low, arr_close, arr_hm,
-          ep: float, ei: int, side: str, n: int):
-    """Trade execution kernel (inlined for performance)"""
+          ep: float, ei: int, side: str, n: int,
+          force_session_close: bool = True,
+          max_hold: int = MAX_HOLD):
+    """Trade execution kernel (inlined for performance)
+    force_session_close=False: no 23:50 forced exit (matches backtest_perfect_order.py behavior)
+    max_hold: max bars to hold (default MAX_HOLD=120; use 50 for system ③ パターン⑤準拠)
+    """
     pnl   = None
     rtype = None
     exit_bar = ei
 
-    for j in range(ei, min(ei + MAX_HOLD, n)):
+    for j in range(ei, min(ei + max_hold, n)):
         bhi = arr_high[j]
         blo = arr_low[j]
         if side == "long":
@@ -313,13 +367,13 @@ def _exec(arr_high, arr_low, arr_close, arr_hm,
                 pnl, rtype, exit_bar = float(TP),  "TP",  j; break
             if bhi >= ep + SL:
                 pnl, rtype, exit_bar = float(-SL), "SL",  j; break
-        if arr_hm[j] in SESSION_BOUNDARIES:
+        if force_session_close and arr_hm[j] in SESSION_BOUNDARIES:
             cl = arr_close[j]
             pnl = float(cl - ep) if side == "long" else float(ep - cl)
             rtype, exit_bar = "SESSION", j; break
 
     if pnl is None:
-        cidx = min(ei + MAX_HOLD - 1, n - 1)
+        cidx = min(ei + max_hold - 1, n - 1)
         cl   = arr_close[cidx]
         pnl  = float(cl - ep) if side == "long" else float(ep - cl)
         rtype = "TIME"
@@ -575,9 +629,9 @@ def main():
 
     # ─ 条件サマリー ─
     print_scenario_header("系統①③合算バックテスト（auto_trade.py 現行条件）")
-    print("  系統①: 月・火・水 / 8,12,15,18,19,20,21,23時 / 3月・7月除外")
-    print("  系統③: 月水木金 / DST:[5,8,12,14,15,19,20,22,23] 冬:[5,12,15,19,20,21,22,23]")
-    print("         / 7月・11月除外 / CPI発表前30min~後60min除外")
+    print("  系統①: 月・火・水 / 8,12,15,18,19,20,21,23時 / 3月・5月・7月・11月除外 / CPI除外なし")
+    print("  系統③: 月・水・木・金(bar START hour) / DST:[5,8,12,14,15,19,20,22,23] 冬:[5,12,15,19,20,21,22,23]")
+    print("         / 5月・7月・11月除外 / CPI発表前30min~後60min除外")
     print("  手数料: 2.2pt込み\n")
 
     # 1. 全体成績
@@ -657,7 +711,85 @@ def main():
         s = calc_summary(active)
         print(f"  {lim_label}  {s['n']:>5}  {skipped:>7}  {months_triggered:>5}  "
               f"{s['win_rate']:>5.1f}%  {s['pnl_yen']:>+11,.0f}  {pf_str(s['pf'])}")
+        
+        # =========================
+    # MA距離フィルター総当たり（Before / After）
+    # =========================
+    print_scenario_header("MA距離フィルター総当たり（Before / After）")
 
+    ma_dist_list = [0.002, 0.003, 0.004]
 
+    # Before
+    base_trades = run_backtest(
+        df, cpi,
+        s1_excl_months=S1_EXCL_BASE,
+        s3_po=False,
+        use_ma_dist=False,
+        use_entry_limit=False,
+    )
+    base_s = calc_summary(base_trades)
+
+    print("\n  [Before]")
+    print(f"  件数={base_s['n']}  勝率={base_s['win_rate']:.1f}%  "
+          f"損益(pt)={base_s['pnl_pt']:+.1f}  損益(円)={base_s['pnl_yen']:+,.0f}  "
+          f"期待値={base_s['ev_pt']:+.2f}  PF={pf_str(base_s['pf'])}")
+
+    print("\n  [After: MA距離フィルター]")
+    print(f"  {'閾値':>8}  {'件数':>6}  {'勝率%':>6}  {'損益(pt)':>10}  "
+          f"{'損益(円)':>12}  {'期待値':>8}  {'PF':>6}  {'Δ損益(pt)':>10}  {'ΔPF':>8}")
+    print("  " + "-" * 95)
+
+    for ma_th in ma_dist_list:
+        ma_trades = run_backtest(
+            df, cpi,
+            s1_excl_months=S1_EXCL_BASE,
+            s3_po=False,
+            use_ma_dist=True,
+            use_entry_limit=False,
+            ma_dist_th=ma_th,
+        )
+        s = calc_summary(ma_trades)
+
+        diff_pnl = s["pnl_pt"] - base_s["pnl_pt"]
+        diff_pf  = s["pf"] - base_s["pf"]
+
+        print(f"  {ma_th:>8.3f}  {s['n']:>6}  {s['win_rate']:>5.1f}%  "
+              f"{s['pnl_pt']:>+10.1f}  {s['pnl_yen']:>+12,.0f}  "
+              f"{s['ev_pt']:>+8.2f}  {pf_str(s['pf'])}  "
+              f"{diff_pnl:>+10.1f}  {diff_pf:>+8.3f}")
+        
+    # =========================
+    # DD発動月の詳細表示
+    # =========================
+    print_scenario_header("DD発動月 詳細")
+
+    for lim in [-20_000, -30_000, -40_000, -50_000]:
+        res = sim_monthly_dd(trades, lim)
+        df_dd = trades.sort_values("signal_dt").copy()
+        df_dd["ym"] = list(zip(df_dd["signal_year"], df_dd["signal_month"]))
+
+        month_pnl = {}
+        triggered = set()
+
+        for _, row in df_dd.iterrows():
+            ym = row["ym"]
+            if ym not in month_pnl:
+                month_pnl[ym] = 0.0
+
+            if ym in triggered:
+                continue
+
+            month_pnl[ym] += row["pnl_yen"]
+            if month_pnl[ym] <= lim:
+                triggered.add(ym)
+
+        # 表示
+        ym_list = sorted(triggered)
+
+        print(f"\n制限 {lim:+,}円 → 発動月 {len(ym_list)}件")
+
+        for y, m in ym_list:
+            print(f"  {y}-{str(m).zfill(2)}")
+     
 if __name__ == "__main__":
     main()

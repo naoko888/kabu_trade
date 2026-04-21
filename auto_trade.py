@@ -2,6 +2,7 @@ import os
 import time
 import requests
 import pandas as pd
+import numpy as np
 import pytz
 from datetime import datetime
 from pathlib import Path
@@ -37,6 +38,18 @@ MICRO_WARMUP_BARS   = 300          # ウォームアップ使用本数
 
 # シグナル判定定数（dual_signal_bot より）
 TOUCH_PCT = 0.005   # MAタッチ判定 ±0.5%
+
+# ===== 系統④：逆張りロング =====
+SYS4_MOVE_PCT      = 0.002    # 直前1本比 -0.2%以上の下落
+SYS4_RSI_TH        = 40       # RSI14 <= 40
+SYS4_VOL_TH        = 0.8      # vol_ratio >= 0.8
+SYS4_LOOKBACK      = 1        # 何本前との比較か
+SYS4_RECOVERY_PCT  = 0.002    # ひげ戻り率 >= 0.2%（(close-low)/close）
+SYS4_EXCLUDE_HOURS = {19}     # 除外時間帯（19時は全負けのため除外）
+SYS4_TP            = 120      # 利確幅（pt）
+SYS4_SL            = 60       # 損切幅（pt）
+SYS4_MAX_HOLD      = 6        # 最大保有足数
+SYS4_DD_LIMIT_YEN  = -3500    # 累積DD上限（円）。超えたら停止。
 
 POLL_SEC = 1.0
 DRY_RUN       = True   # True=1570もDRY（注文なし）
@@ -170,6 +183,12 @@ micro_current_month     = None     # 現在の年月 (year, month)
 # マイクロ先物 インジケーターウォームアップカウンター
 # CSV停止期間があった場合、起動後26本は誤シグナルを防ぐためエントリーをスキップ
 micro_warmup_remaining = 0   # 0 = 通常稼働
+
+# 系統④ 状態管理
+sys4_monthly_pnl_yen      = 0.0   # 系統④ 月次累積損益（円）。毎月1日リセット。
+sys4_stopped              = False  # True=今月のDD上限到達で停止中
+sys4_current_month        = None   # 現在の年月 (year, month)。月次リセット用。
+sys4_last_signal_bar_time = None   # 重複エントリー防止用
 
 # 1570 日中処理済みフラグ（夜間ループ継続用）
 etf_closed_today = False
@@ -711,6 +730,22 @@ def add_micro_indicators(df):
     df["vol_ma20"]  = df["volume"].rolling(20).mean()
     df["vol_ratio"] = df["volume"] / df["vol_ma20"]
 
+    # RSI14（系統④用）
+    _delta   = df["close"].diff()
+    _up      = _delta.clip(lower=0)
+    _down    = -_delta.clip(upper=0)
+    _avg_up  = _up.rolling(14).mean()
+    _avg_dn  = _down.rolling(14).mean()
+    _rs      = _avg_up / _avg_dn.replace(0, np.nan)
+    df["rsi14"] = 100 - (100 / (1 + _rs))
+
+    # ATR14（系統④ NaNチェック用）
+    _prev_c  = df["close"].shift(1)
+    _tr1     = df["high"] - df["low"]
+    _tr2     = (df["high"] - _prev_c).abs()
+    _tr3     = (df["low"]  - _prev_c).abs()
+    df["atr14"] = pd.concat([_tr1, _tr2, _tr3], axis=1).max(axis=1).rolling(14).mean()
+
     # ボリンジャーバンド幅（スクイーズ判定用）
     bb_mid              = df["close"].rolling(20).mean()
     bb_std              = df["close"].rolling(20).std()
@@ -720,11 +755,58 @@ def add_micro_indicators(df):
     return df
 
 
+def check_sys4_signal(df):
+    """系統④：逆張りロング シグナル判定
+
+    条件：
+    - 直前SYS4_LOOKBACK本前のcloseと比較してSYS4_MOVE_PCT以上下落
+    - RSI14 <= SYS4_RSI_TH
+    - vol_ratio >= SYS4_VOL_TH
+    - ひげ戻り率 >= SYS4_RECOVERY_PCT（(close-low)/close）
+    - 現在時刻の時間（bar開始時刻のhour）がSYS4_EXCLUDE_HOURSに含まれない
+
+    ※ バックテスト（gyakubari_monthly_yearly.py）との完全一致のため：
+      - シグナル評価は確定済み足（df_confirmed = df.iloc[:-1]）の最終行で行う
+      - hour判定はbar開始時刻のhour（dt.hour）を使用する
+      - インジケーターはadd_micro_indicators()で計算済みの
+        rsi14・vol_ratio・atr14を使用する
+    """
+    if df is None or len(df) < 22:  # lookback1 + RSI14期間20 + 余裕
+        return False
+
+    cur  = df.iloc[-1]
+    prev = df.iloc[-1 - SYS4_LOOKBACK]
+
+    # NaNチェック
+    for col in ["rsi14", "vol_ratio", "atr14"]:
+        if pd.isna(cur[col]):
+            return False
+
+    dt   = pd.to_datetime(cur["datetime"])
+    hour = dt.hour  # bar開始時刻のhour（BTと統一）
+
+    # 除外時間帯チェック
+    if hour in SYS4_EXCLUDE_HOURS:
+        return False
+
+    # 下落率
+    move_pct = (cur["close"] - prev["close"]) / prev["close"]
+    # ひげ戻り率
+    recovery = (cur["close"] - cur["low"]) / cur["close"] if cur["close"] != 0 else 0
+
+    return all([
+        move_pct <= -SYS4_MOVE_PCT,
+        cur["rsi14"] <= SYS4_RSI_TH,
+        cur["vol_ratio"] >= SYS4_VOL_TH,
+        recovery >= SYS4_RECOVERY_PCT,
+    ])
+
+
 # =========================
 # マイクロ シグナル判定（系統①②③統合版）
 # 戻り値: list of fired systems  例 ["①"], ["③"], ["①","③"], []
 #
-# 系統①: long  月木 × 18〜23時 × 3月・7月除外
+# 系統①: long  月火水 × 8/12/15/18/19/20/21/23時 × 3月・5月・7月・11月除外 / CPI除外なし
 # 系統②: long  火水 × vol>=2.0 × BB拡大中 × 5〜9月除外
 # 系統③: short 月水木金 × DST:[5,8,12,14,15,19,20,22,23] 冬:[5,12,15,19,20,21,22,23] × 7月・11月除外 × CPI除外
 # =========================
@@ -751,11 +833,16 @@ def check_micro_signal(df):
     c1   = row_p["close"];   c2 = row_p2["close"]
 
     # シグナルバーの日時属性
-    # hr は足終了時刻基準（+5分）でバックテストとの整合を取る
-    # 例: 14:55足(start) → (14:55+5min).hour = 15 = backtest終了時刻15:00のhour
+    # hr    : 足終了時刻基準（+5分）→ 系統① に使用
+    # hr_s3 : 足開始時刻基準（bar START hour）→ 系統③ に使用（backtest_system12_combined.py と統一）
     dt    = pd.to_datetime(row["datetime"])
-    wd    = dt.weekday()   # 0=月, 1=火, 2=水, 3=木, 4=金
+    wd    = dt.weekday()   # 0=月, 1=火, 2=水, 3=木, 4=金, 5=土, 6=日
     hr    = (dt + pd.Timedelta(minutes=5)).hour
+    hr_s3 = dt.hour
+
+    # 土曜日（金曜夜間セッション後半 00:00〜05:55）はエントリー禁止
+    if wd == 5:
+        return []
     month = dt.month
 
     fired = []
@@ -805,9 +892,9 @@ def check_micro_signal(df):
             else:
                 s3_hours = (5, 12, 15, 19, 20, 21, 22, 23)
 
-            if hr not in s3_hours:
+            if hr_s3 not in s3_hours:
                 log(
-                    f"[系統③] 時間帯対象外({hr}時, "
+                    f"[系統③] 時間帯対象外({hr_s3}時, "
                     f"{'DST' if is_dst(now_dt) else '冬時間'}): スキップ"
                 )
             elif is_cpi_window(now_dt, cpi_df):
@@ -1174,15 +1261,60 @@ def monitor_micro_dry(now, hhmm, verbose=False):
                 global micro_monthly_pnl, micro_monthly_skip
                 trade_yen = round(pnl * MICRO_PT_TO_YEN - MICRO_COMMISSION_YEN, 0)
                 micro_monthly_pnl += trade_yen
+                log(f"[MICRO①③] 月次損益:{micro_monthly_pnl:,.0f}円  DD上限:{MICRO_MONTHLY_DD_LIMIT:,.0f}円")
                 if micro_monthly_pnl <= MICRO_MONTHLY_DD_LIMIT and not micro_monthly_skip:
                     micro_monthly_skip = True
                     log(f"[MICRO①③] 月次DD制限発動: 累計{micro_monthly_pnl:,.0f}円 → 今月の残りをスキップ")
+
+            # ── 系統④ 月次DD更新 ──
+            if sys_label == "④":
+                global sys4_monthly_pnl_yen, sys4_stopped
+                trade_yen = round(pnl * MICRO_PT_TO_YEN - MICRO_COMMISSION_YEN, 0)
+                sys4_monthly_pnl_yen += trade_yen
+                log(f"[系統④] 月次損益:{sys4_monthly_pnl_yen:,.0f}円  DD上限:{SYS4_DD_LIMIT_YEN:,.0f}円")
+                if sys4_monthly_pnl_yen <= SYS4_DD_LIMIT_YEN and not sys4_stopped:
+                    sys4_stopped = True
+                    log(f"[系統④] 月次DD上限到達({sys4_monthly_pnl_yen:,.0f}円) → 今月の系統④を停止")
             LOG_DIR.mkdir(exist_ok=True)
             all_file = LOG_DIR / "micro_dry_log_all.csv"
             last_trade = pd.DataFrame([micro_dry_trade_log[-1]])
             last_trade.to_csv(all_file, mode='a', header=not all_file.exists(), index=False, encoding="utf-8-sig")
             log(f"[LOG] マイクロログ保存: {all_file}")
         else:
+            # 系統④: hold_bars インクリメント → MAX_HOLD到達で時間決済
+            if pos.get("system") == "④":
+                pos["hold_bars"] = pos.get("hold_bars", 0) + 1
+                if pos["hold_bars"] >= pos.get("max_hold", SYS4_MAX_HOLD):
+                    reason = "TIME決済(MAX_HOLD)"
+                    sys_label = "④"
+                    prefix    = "[MICRO④]"
+                    micro_dry_day_pnl += pnl
+                    micro_dry_trade_log.append({
+                        "system":      sys_label,
+                        "side":        side,
+                        "entry_time":  pos["entry_time"].strftime("%Y-%m-%d %H:%M:%S"),
+                        "exit_time":   now.strftime("%Y-%m-%d %H:%M:%S"),
+                        "entry_price": pos["entry_price"],
+                        "exit_price":  cp,
+                        "pnl":         round(pnl, 1),
+                        "reason":      reason,
+                        "signal_bid":  pos.get("signal_bid"),
+                        "signal_ask":  pos.get("signal_ask"),
+                        "spread":      pos.get("spread"),
+                        "slip_est":    pos.get("slip_est"),
+                    })
+                    log(f"[EXIT] {prefix} 系統④ 決済:{reason} @ {cp:.0f}  損益:{pnl:+.0f}  本日累計:{micro_dry_day_pnl:+.0f}")
+                    trade_yen = round(pnl * MICRO_PT_TO_YEN - MICRO_COMMISSION_YEN, 0)
+                    sys4_monthly_pnl_yen += trade_yen
+                    log(f"[系統④] 月次損益:{sys4_monthly_pnl_yen:,.0f}円  DD上限:{SYS4_DD_LIMIT_YEN:,.0f}円")
+                    if sys4_monthly_pnl_yen <= SYS4_DD_LIMIT_YEN and not sys4_stopped:
+                        sys4_stopped = True
+                        log(f"[系統④] 月次DD上限到達({sys4_monthly_pnl_yen:,.0f}円) → 今月の系統④を停止")
+                    LOG_DIR.mkdir(exist_ok=True)
+                    all_file = LOG_DIR / "micro_dry_log_all.csv"
+                    last_trade = pd.DataFrame([micro_dry_trade_log[-1]])
+                    last_trade.to_csv(all_file, mode='a', header=not all_file.exists(), index=False, encoding="utf-8-sig")
+                    continue  # still_openに追加しない（クローズ済み）
             still_open.append(pos)
             if verbose:
                 mode_tag = "LIVE" if not MICRO_DRY_RUN else "DRY"
@@ -1198,6 +1330,7 @@ def monitor_micro_dry(now, hhmm, verbose=False):
 def check_micro_entry(now, micro_board):
     global micro_dry_positions, micro_last_signal_bar_time, micro_warmup_remaining
     global micro_monthly_pnl, micro_monthly_skip, micro_current_month
+    global sys4_monthly_pnl_yen, sys4_stopped, sys4_last_signal_bar_time
 
     # ── 系統①③合算 月次リセット（シグナル条件に関わらず毎足チェック）──
     now_ym = (now.year, now.month)
@@ -1206,6 +1339,14 @@ def check_micro_entry(now, micro_board):
         micro_monthly_pnl   = 0.0
         micro_monthly_skip  = False
         log(f"[MICRO①③] 月次リセット: {now_ym} 累計損益リセット")
+
+    # ── 系統④ 月次リセット ──
+    global sys4_monthly_pnl_yen, sys4_stopped, sys4_current_month
+    if sys4_current_month != now_ym:
+        sys4_current_month   = now_ym
+        sys4_monthly_pnl_yen = 0.0
+        sys4_stopped         = False
+        log(f"[系統④] 月次リセット: {now_ym} 損益リセット・停止解除")
 
     df = micro_bars_to_df()
     if df is None or len(df) < 31:   # 確定足30本 + current_bar 1本 = 最低31本
@@ -1222,16 +1363,39 @@ def check_micro_entry(now, micro_board):
     if micro_last_signal_bar_time == latest_bar_time:
         return  # 同一確定足で重複判定しない
 
-    # ── セッション跨ぎによる陳腐化足のスキップ ──
-    # 15:40〜17:00 / 5:55〜8:45 のセッション間ギャップ中はバー更新が止まるため、
-    # 次セッション開始時に前セッション最終足（例: 15:35足→hr=15）が
-    # 初めて「確定足」になって17:00頃に評価されてしまう問題を防ぐ。
-    # 確定足の開始から10分以上経過している場合は評価せずにロックする。
+    # ── セッション跨ぎ / 陳腐化足のスキップ ──
+    # セッション間ギャップ（15:40〜17:00 / 5:55〜8:45）中はバー更新が止まるため、
+    # 次セッション開始時に前セッション最終足が「確定足」として評価されてしまう問題を防ぐ。
+    # ① 前セッションの足（セッション開始時刻より古い）→ 正常なギャップ跨ぎとして除外
+    # ② 同セッション内で10分以上経過 → データ遅延等の陳腐化として除外
+    from datetime import timedelta as _td
+
     now_naive = now.replace(tzinfo=None)
     bar_dt    = pd.Timestamp(latest_bar_time).to_pydatetime()
+
+    hhmm_now = now_naive.hour * 100 + now_naive.minute
+    if hhmm_now >= 1700:
+        # 夜間セッション（17:00〜）
+        session_start = now_naive.replace(hour=17, minute=0, second=0, microsecond=0)
+    elif hhmm_now >= 845:
+        # 日中セッション または 日中→夜間ギャップ（8:45〜16:59）
+        session_start = now_naive.replace(hour=8, minute=45, second=0, microsecond=0)
+    else:
+        # 深夜〜早朝（〜8:44）: 前日17:00スタートの夜間セッション継続中
+        yesterday = now_naive - _td(days=1)
+        session_start = yesterday.replace(hour=17, minute=0, second=0, microsecond=0)
+
+    if bar_dt < session_start:
+        # 前セッションの足: 正常なセッション跨ぎ（陳腐化ではない）→ ロックして除外
+        micro_last_signal_bar_time = latest_bar_time
+        log(f"[MICRO] 前セッション足スキップ: {bar_dt.strftime('%H:%M')} "
+            f"(現セッション開始:{session_start.strftime('%H:%M')}) → 評価対象外")
+        return
+
     bar_age_min = (now_naive - bar_dt).total_seconds() / 60
     if bar_age_min > 10:
-        micro_last_signal_bar_time = latest_bar_time  # ロック（再評価しない）
+        # 同セッション内で10分以上経過: データ遅延等による陳腐化 → ロックして除外
+        micro_last_signal_bar_time = latest_bar_time
         log(f"[MICRO] 陳腐化足スキップ: {bar_dt.strftime('%H:%M')} ({bar_age_min:.0f}分前) → 評価対象外")
         return
 
@@ -1249,6 +1413,77 @@ def check_micro_entry(now, micro_board):
         cp = get_price_from_board(micro_board)
         cp_str = f"{float(cp):.0f}" if cp else "取得失敗"
         log(f"[MICRO] → シグナルなし (現在値:{cp_str} bars:{len(df_confirmed)}本)")
+
+    # ===== 系統④：逆張りロング判定 =====
+    # DD上限チェック
+    if sys4_stopped:
+        log(f"[系統④] 月次DD上限到達のため停止中 (月次DD:{sys4_monthly_pnl_yen:,.0f}円)")
+    elif check_sys4_signal(df_confirmed):
+        # 同一確定足での重複判定防止
+        if sys4_last_signal_bar_time != latest_bar_time:
+            sys4_last_signal_bar_time = latest_bar_time
+
+            cp4 = get_price_from_board(micro_board)
+            if cp4 is None:
+                log("[WARN] [系統④] 現在値取得失敗 → エントリースキップ")
+            else:
+                cp4      = float(cp4)
+                sl_price = cp4 - SYS4_SL
+                tp_price = cp4 + SYS4_TP
+
+                best_bid = micro_board.get("BidPrice")
+                best_ask = micro_board.get("AskPrice")
+                best_bid = float(best_bid) if best_bid else None
+                best_ask = float(best_ask) if best_ask else None
+                spread   = round(best_ask - best_bid, 1) if (best_ask and best_bid) else None
+                slip_est = round(best_ask - cp4, 1) if best_ask else None
+
+                pos4 = {
+                    "system":      "④",
+                    "side":        "long",
+                    "entry_time":  now,
+                    "entry_price": cp4,
+                    "sl_price":    sl_price,
+                    "tp_price":    tp_price,
+                    "max_hold":    SYS4_MAX_HOLD,
+                    "hold_bars":   0,
+                    "signal_bid":  best_bid,
+                    "signal_ask":  best_ask,
+                    "spread":      spread,
+                    "slip_est":    slip_est,
+                }
+
+                bid_str  = f"{best_bid:.0f}" if best_bid else "---"
+                ask_str  = f"{best_ask:.0f}" if best_ask else "---"
+                slip_str = f"{slip_est:+.1f}pt" if slip_est is not None else "---"
+                log(f"[LONG] [系統④] 逆張りロング @ {cp4:.0f}"
+                    f"  SL:{sl_price:.0f}  TP:{tp_price:.0f}"
+                    f"  Bid:{bid_str} Ask:{ask_str} Spread:{spread} SlipEst:{slip_str}")
+
+                if MICRO_DRY_RUN:
+                    micro_dry_positions.append(pos4)
+                else:
+                    oid4 = send_micro_order("buy")
+                    if oid4:
+                        pos4["order_id"] = oid4
+                        fill_price = _wait_for_fill(oid4, max_retries=10, interval=1.0)
+                        if fill_price is None:
+                            log("[WARN] [系統④] 約定未確認 → 注文キャンセル")
+                            cancel_micro_order(oid4)
+                        else:
+                            pos4["entry_price"] = fill_price
+                            pos4["sl_price"]    = fill_price - SYS4_SL
+                            pos4["tp_price"]    = fill_price + SYS4_TP
+                            log(f"[FILL] [系統④] 約定:{fill_price:.0f}"
+                                f"  SL:{pos4['sl_price']:.0f}  TP:{pos4['tp_price']:.0f}")
+                            sl_oid4, tp_oid4 = send_micro_sl_tp_orders(
+                                "buy", pos4["sl_price"], pos4["tp_price"]
+                            )
+                            pos4["sl_order_id"] = sl_oid4
+                            pos4["tp_order_id"] = tp_oid4
+                            micro_dry_positions.append(pos4)
+
+    if not fired:
         return
 
     cp = get_price_from_board(micro_board)
@@ -1344,7 +1579,8 @@ def main():
     print("=" * 60)
     print("1570 自動売買 + マイクロ先物 dual_signal 統合Bot 起動")
     print(f"1570: 損切り:-{STOP} 利確:+{TP} LOT:{LOT}  DRY_RUN={DRY_RUN}")
-    print(f"マイクロ: SL:{MICRO_SL} TP:{MICRO_TP}  系統①月木×夜間  系統②火水×精密  系統③short緩和版")
+    print(f"マイクロ: SL:{MICRO_SL} TP:{MICRO_TP}  系統①月火水×昼夜間/CPI除外なし  系統③short月水木金  系統④逆張りlong")
+    print(f"系統①時間帯: 8/12/15/18/19/20/21/23時  系統③時間帯DST: 5/8/12/14/15/19/20/22/23時  冬: 5/12/15/19/20/21/22/23時")
     print("=" * 60)
 
     # ── マイクロウォームアップ（起動時に過去足を読み込む）──
@@ -1374,12 +1610,26 @@ def main():
             last_verbose_min = now.minute
 
         # 土日・休場日は全処理スキップ（マイクロも休場）
-        if weekday >= 5 or is_holiday(now.date()):
+        # 土曜00:00〜05:59は金曜夜間セッション後半のため除外
+        is_sat_night_session = (weekday == 5 and hhmm < 600)
+        if (weekday >= 5 or is_holiday(now.date())) and not is_sat_night_session:
             time.sleep(60)
             continue
 
-        # ── 深夜 23:50 に完全終了 ──
-        if hhmm >= 2350:
+        # ── 深夜終了判定 ──
+        # 金曜(weekday==4): 夜間セッションが翌朝05:55まで継続 → 23:50では終了しない
+        # 金曜以外: 23:50終了 / 土曜06:00以降: 金曜夜間後半終了 → 終了
+        is_session_end = (
+            (weekday != 4 and hhmm >= 2350) or  # 金曜以外の23:50終了
+            (weekday == 5 and hhmm >= 600)        # 土曜06:00（金曜夜間後半終了後）
+        )
+        if is_session_end:
+            # 金曜夜間はポジション持越しNG（土曜はマーケット休場のため）
+            # weekday==4(金)は23:50より前にマイクロポジションが閉じているはずだが
+            # 万一残っていた場合は強制決済する
+            if micro_dry_positions:
+                log("[警告] 金曜夜間終了時にマイクロポジションが残存 → 強制クローズ")
+                monitor_micro_dry(now, 2350)  # hhmm=2350渡しで夜間強制決済トリガー
             if position:
                 close_position("深夜強制決済")
             if micro_dry_positions:

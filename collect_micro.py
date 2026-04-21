@@ -343,14 +343,22 @@ def main():
         weekday = now.weekday()  # 0=月 〜 6=日
 
         # 土日・休場日は全休み
-        if weekday >= 5 or is_holiday(now.date()):
+        # 土曜00:00〜05:59は金曜夜間セッション後半のため継続
+        is_sat_night_session = (weekday == 5 and hhmm < 600)
+        if (weekday >= 5 or is_holiday(now.date())) and not is_sat_night_session:
             log(f"休場日 → 60秒待機 ({now.strftime('%Y-%m-%d')})")
             time.sleep(60)
             continue
 
+        # 土曜06:00：金曜夜間セッション終了 → CSV保存して終了
+        if weekday == 5 and hhmm >= 600:
+            log("金曜夜間セッション終了（土曜06:00） → CSV保存して終了")
+            df = bars_to_df()
+            save_to_csv(df)
+            break
+
         # 非取引時間（セッション間・早朝）
         if not is_trading_time(hhmm):
-            log(f"非取引時間 ({now.strftime('%H:%M')}) → 30秒待機")
             time.sleep(30)
             continue
 
