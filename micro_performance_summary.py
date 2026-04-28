@@ -29,13 +29,38 @@ MICRO_MONTHLY_DD_LIMIT = -30_000  # 円
 
 # ★ 実運用コードと揃える
 S1_WEEKDAYS = (0, 1, 2)  # 月火水
-S1_HOURS = (8, 12, 15, 18, 19, 20, 21, 23)
-S1_EXCL_MONTHS = (3, 5, 7, 11)
+S1_HOURS_DST = (8, 15, 18, 19, 20, 21)
+S1_HOURS_WIN = (8, 12, 15, 18, 20, 21, 23)
+S1_EXCL_MONTHS = (3, 5, 11)
 
 S3_WEEKDAYS = (0, 2, 3, 4)  # 月水木金
 S3_EXCL_MONTHS = (5, 7, 11)
 S3_HOURS_DST = (5, 8, 12, 14, 15, 19, 20, 22, 23)
 S3_HOURS_WIN = (5, 12, 15, 19, 20, 21, 22, 23)
+
+# 系統④：逆張りロング
+SYS4_MOVE_PCT      = 0.002
+SYS4_RSI_TH        = 40
+SYS4_VOL_TH        = 0.8
+SYS4_LOOKBACK      = 1
+SYS4_RECOVERY_PCT  = 0.002
+SYS4_EXCLUDE_HOURS = {19}
+SYS4_TP            = 120
+SYS4_SL            = 60
+SYS4_MAX_HOLD      = 6
+
+# 系統⑤：逆張りショート
+SYS5_MOVE_PCT      = 0.003
+SYS5_RSI_TH        = 70
+SYS5_VOL_TH        = 0.8
+SYS5_LOOKBACK      = 3
+SYS5_RECOVERY_PCT  = 0.002
+SYS5_TP            = 120
+SYS5_SL            = 60
+SYS5_MAX_HOLD      = 6
+
+# ④⑤合算DD
+SYS45_DD_LIMIT_YEN = -3000
 
 SESSION_BOUNDARIES = frozenset({2350})
 
@@ -119,7 +144,7 @@ def load_live_log():
     df["pnl"] = pd.to_numeric(df["pnl"], errors="coerce")
 
     df = df.dropna(subset=["entry_time", "exit_time", "pnl"]).copy()
-    df = df[df["system"].astype(str).isin(["①", "③"])].copy()
+    df = df[df["system"].astype(str).isin(["①", "③", "④", "⑤"])].copy()
 
     # 手数料込み
     df["pnl_pt"] = df["pnl"] - COMMISSION_PT
@@ -167,16 +192,28 @@ def add_indicators(df: pd.DataFrame):
     df["macd"] = ema_fast - ema_slow
     df["macd_sig"] = df["macd"].ewm(span=9, adjust=False).mean()
 
+    # 追加
+    df["vol_ma20"] = df["volume"].rolling(20).mean()
+    df["vol_ratio"] = df["volume"] / df["vol_ma20"]
+
+    delta = df["close"].diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    avg_up = up.rolling(14).mean()
+    avg_down = down.rolling(14).mean()
+    rs = avg_up / avg_down.replace(0, pd.NA)
+    df["rsi14"] = 100 - (100 / (1 + rs))
+
     return df
 
 
 # =========================
 # BT実行
 # =========================
-def exec_trade(df: pd.DataFrame, entry_idx: int, side: str):
+def exec_trade_sys(df: pd.DataFrame, entry_idx: int, side: str, tp: int, sl: int, max_hold: int):
     ep = float(df.iloc[entry_idx]["open"])
 
-    for j in range(entry_idx, min(entry_idx + MAX_HOLD, len(df))):
+    for j in range(entry_idx, min(entry_idx + max_hold, len(df))):
         row = df.iloc[j]
         bhi = float(row["high"])
         blo = float(row["low"])
@@ -184,22 +221,22 @@ def exec_trade(df: pd.DataFrame, entry_idx: int, side: str):
         hhmm = dt.hour * 100 + dt.minute
 
         if side == "long":
-            if bhi >= ep + MICRO_TP:
-                return MICRO_TP - COMMISSION_PT, dt, "TP"
-            if blo <= ep - MICRO_SL:
-                return -MICRO_SL - COMMISSION_PT, dt, "SL"
+            if bhi >= ep + tp:
+                return tp - COMMISSION_PT, dt, "TP"
+            if blo <= ep - sl:
+                return -sl - COMMISSION_PT, dt, "SL"
         else:
-            if blo <= ep - MICRO_TP:
-                return MICRO_TP - COMMISSION_PT, dt, "TP"
-            if bhi >= ep + MICRO_SL:
-                return -MICRO_SL - COMMISSION_PT, dt, "SL"
+            if blo <= ep - tp:
+                return tp - COMMISSION_PT, dt, "TP"
+            if bhi >= ep + sl:
+                return -sl - COMMISSION_PT, dt, "SL"
 
         if hhmm in SESSION_BOUNDARIES:
             close_price = float(row["close"])
             pnl = (close_price - ep) if side == "long" else (ep - close_price)
             return pnl - COMMISSION_PT, dt, "SESSION"
 
-    last_idx = min(entry_idx + MAX_HOLD - 1, len(df) - 1)
+    last_idx = min(entry_idx + max_hold - 1, len(df) - 1)
     last_row = df.iloc[last_idx]
     dt = pd.Timestamp(last_row["datetime"])
     close_price = float(last_row["close"])
@@ -218,7 +255,7 @@ def build_bt_trades(df: pd.DataFrame, cpi_df: pd.DataFrame):
         row_p = df.iloc[sig_i - 1]
         row_p2 = df.iloc[sig_i - 2]
 
-        need = ["ma9", "ma10", "ma20", "macd", "macd_sig"]
+        need = ["ma9", "ma10", "ma20", "macd", "macd_sig", "rsi14", "vol_ratio"]
         if any(pd.isna(row[c]) for c in need):
             continue
         if any(pd.isna(row_p[c]) for c in need):
@@ -251,15 +288,20 @@ def build_bt_trades(df: pd.DataFrame, cpi_df: pd.DataFrame):
         touch_lo = (abs(lo - m9) / m9 <= TOUCH_PCT) or (abs(lo - m10) / m10 <= TOUCH_PCT)
         gc = macd > macd_sig
 
-        if (
+        s1_hours = S1_HOURS_DST if is_dst(dt) else S1_HOURS_WIN
+        # ★セッションギャップ除外
+        ent_dt = pd.Timestamp(df.iloc[ent_i]["datetime"])
+        gap_min = (ent_dt - dt).total_seconds() / 60
+        
+        if gap_min <= 10 and (
             above_ma
             and touch_lo
             and gc
             and wd in S1_WEEKDAYS
-            and hr in S1_HOURS
+            and hr in s1_hours
             and month not in S1_EXCL_MONTHS
         ):
-            pnl_pt, exit_time, reason = exec_trade(df, ent_i, "long")
+            pnl_pt, exit_time, reason = exec_trade_sys(df, ent_i, "long", MICRO_TP, MICRO_SL, MAX_HOLD)
             entry_time = pd.Timestamp(df.iloc[ent_i]["datetime"])
             trades.append({
                 "system": "①",
@@ -285,8 +327,14 @@ def build_bt_trades(df: pd.DataFrame, cpi_df: pd.DataFrame):
             and month not in S3_EXCL_MONTHS
         ):
             s3_hours = S3_HOURS_DST if is_dst(dt) else S3_HOURS_WIN
-            if hr_s3 in s3_hours and not is_cpi_window(dt, cpi_df):
-                pnl_pt, exit_time, reason = exec_trade(df, ent_i, "short")
+
+            # ★セッションギャップ除外
+            ent_dt = pd.Timestamp(df.iloc[ent_i]["datetime"])
+            gap_min = (ent_dt - dt).total_seconds() / 60
+            if gap_min > 10:
+                pass
+            elif hr_s3 in s3_hours and not is_cpi_window(dt, cpi_df):
+                pnl_pt, exit_time, reason = exec_trade_sys(df, ent_i, "short", MICRO_TP, MICRO_SL, MAX_HOLD)
                 entry_time = pd.Timestamp(df.iloc[ent_i]["datetime"])
                 trades.append({
                     "system": "③",
@@ -298,6 +346,59 @@ def build_bt_trades(df: pd.DataFrame, cpi_df: pd.DataFrame):
                     "reason": reason,
                     "trade_date": get_trade_date(entry_time),
                 })
+
+        # 系統④（逆張りロング）
+        move_pct_4 = (row["close"] - row_p["close"]) / row_p["close"]
+        recovery_4 = (row["close"] - row["low"]) / row["close"] if row["close"] != 0 else 0
+        hr_s4 = dt.hour  # bar START hour
+
+        if (
+            hr_s4 not in SYS4_EXCLUDE_HOURS
+            and not pd.isna(row["rsi14"])
+            and not pd.isna(row["vol_ratio"])
+            and move_pct_4 <= -SYS4_MOVE_PCT
+            and row["rsi14"] <= SYS4_RSI_TH
+            and row["vol_ratio"] >= SYS4_VOL_TH
+            and recovery_4 >= SYS4_RECOVERY_PCT
+        ):
+            pnl_pt, exit_time, reason = exec_trade_sys(df, ent_i, "long", SYS4_TP, SYS4_SL, SYS4_MAX_HOLD)
+            entry_time = pd.Timestamp(df.iloc[ent_i]["datetime"])
+            trades.append({
+                "system": "④",
+                "side": "long",
+                "entry_time": entry_time,
+                "exit_time": exit_time,
+                "pnl_pt": round(pnl_pt, 4),
+                "pnl_yen": int(round(pnl_pt * PT_TO_YEN, 0)),
+                "reason": reason,
+                "trade_date": get_trade_date(entry_time),
+            })
+
+        # 系統⑤（逆張りショート）
+        prev5 = df.iloc[sig_i - SYS5_LOOKBACK]
+        move_pct_5 = (row["close"] - prev5["close"]) / prev5["close"]
+        recovery_5 = (row["high"] - row["close"]) / row["close"] if row["close"] != 0 else 0
+
+        if (
+            not pd.isna(row["rsi14"])
+            and not pd.isna(row["vol_ratio"])
+            and move_pct_5 >= SYS5_MOVE_PCT
+            and row["rsi14"] >= SYS5_RSI_TH
+            and row["vol_ratio"] >= SYS5_VOL_TH
+            and recovery_5 >= SYS5_RECOVERY_PCT
+        ):
+            pnl_pt, exit_time, reason = exec_trade_sys(df, ent_i, "short", SYS5_TP, SYS5_SL, SYS5_MAX_HOLD)
+            entry_time = pd.Timestamp(df.iloc[ent_i]["datetime"])
+            trades.append({
+                "system": "⑤",
+                "side": "short",
+                "entry_time": entry_time,
+                "exit_time": exit_time,
+                "pnl_pt": round(pnl_pt, 4),
+                "pnl_yen": int(round(pnl_pt * PT_TO_YEN, 0)),
+                "reason": reason,
+                "trade_date": get_trade_date(entry_time),
+            })
 
     if not trades:
         return pd.DataFrame(columns=["system", "side", "entry_time", "exit_time", "pnl_pt", "pnl_yen", "reason", "trade_date"])
@@ -345,8 +446,10 @@ def calc_metrics(df: pd.DataFrame):
         return {
             "PF": 0.0,
             "勝率": 0.0,
-            "Long": 0,
-            "Short": 0,
+            "Long①": 0,
+            "Long④": 0,
+            "Short③": 0,
+            "Short⑤": 0,
             "件数": 0,
             "期待値pt": 0.0,
             "損益pt": 0.0,
@@ -365,8 +468,13 @@ def calc_metrics(df: pd.DataFrame):
     return {
         "PF": round(float(pf), 3),
         "勝率": round(float(win_rate), 1),
-        "Long": int((df["side"] == "long").sum()),
-        "Short": int((df["side"] == "short").sum()),
+
+        # ★ここ追加
+        "Long①": int(((df["system"] == "①") & (df["side"] == "long")).sum()),
+        "Long④": int(((df["system"] == "④") & (df["side"] == "long")).sum()),
+        "Short③": int(((df["system"] == "③") & (df["side"] == "short")).sum()),
+        "Short⑤": int(((df["system"] == "⑤") & (df["side"] == "short")).sum()),
+
         "件数": int(n),
         "期待値pt": round(float(ev), 2),
         "損益pt": round(float(pnl.sum()), 1),
@@ -378,8 +486,13 @@ def make_diff_row(live_m: dict, bt_m: dict):
     return {
         "PF": round(live_m["PF"] - bt_m["PF"], 3),
         "勝率": round(live_m["勝率"] - bt_m["勝率"], 1),
-        "Long": live_m["Long"] - bt_m["Long"],
-        "Short": live_m["Short"] - bt_m["Short"],
+
+        # ★ここ修正
+        "Long①": live_m["Long①"] - bt_m["Long①"],
+        "Long④": live_m["Long④"] - bt_m["Long④"],
+        "Short③": live_m["Short③"] - bt_m["Short③"],
+        "Short⑤": live_m["Short⑤"] - bt_m["Short⑤"],
+
         "件数": live_m["件数"] - bt_m["件数"],
         "期待値pt": round(live_m["期待値pt"] - bt_m["期待値pt"], 2),
         "損益pt": round(live_m["損益pt"] - bt_m["損益pt"], 1),
@@ -394,7 +507,7 @@ def make_signal_key(df):
     tmp["entry_time_5m"] = tmp["entry_time"].dt.floor("5min")
     return set(
         zip(
-            tmp["entry_time_5m"].dt.strftime("%H:%M"),
+            tmp["entry_time_5m"].dt.strftime("%m/%d %H:%M"),
             tmp["system"].astype(str),
             tmp["side"].astype(str),
         )
@@ -454,7 +567,7 @@ def print_bar_count_diff(title: str, live_df: pd.DataFrame, bt_df: pd.DataFrame)
     print("\n[差分あり]")
     diff = diff.sort_values(["bar_time", "system", "side"])
     for _, r in diff.iterrows():
-        t = pd.Timestamp(r["bar_time"]).strftime("%H:%M")
+        t = pd.Timestamp(r["bar_time"]).strftime("%m/%d %H:%M")
         print(
             f"  {t}  {r['system']}  {r['side']}  "
             f"実運用={r['count_live']}件  BT={r['count_bt']}件"
@@ -485,16 +598,18 @@ def print_match_result(title: str, live_df: pd.DataFrame, bt_df: pd.DataFrame):
 
 def print_metric_row(period_label: str, label: str, m: dict):
     print(
-        f"{period_label:<6} "
-        f"{label:<6} "
-        f"{m['PF']:<6} "
-        f"{str(m['勝率'])+'%':<7} "
-        f"{m['Long']:<5} "
-        f"{m['Short']:<6} "
-        f"{m['件数']:<6} "
-        f"{m['期待値pt']:<10} "
-        f"{m['損益pt']:<8} "
-        f"{m['損益円']:<8,}"
+        f"{period_label:>6}"
+        f"{label:>8}"
+        f"{m['PF']:>10.3f}"
+        f"{str(m['勝率'])+'%':>10}"
+        f"{m['Long①']:>8}"
+        f"{m['Long④']:>8}"
+        f"{m['Short③']:>8}"
+        f"{m['Short⑤']:>8}"
+        f"{m['件数']:>8}"
+        f"{m['期待値pt']:>12.2f}"
+        f"{m['損益pt']:>12.1f}"
+        f"{m['損益円']:>14,}"
     )
 
 
@@ -522,6 +637,13 @@ def main():
     csv_df = add_indicators(csv_df)
     bt_df = build_bt_trades(csv_df, cpi_df)
 
+    # ▼ここから追加（④⑤の内訳確認）
+    tmp = bt_df[bt_df["system"].isin(["④", "⑤"])].copy()
+    tmp["date"] = tmp["entry_time"].dt.date
+
+    print("\n===== ④⑤ 日別件数 =====")
+    print(tmp.groupby(["date", "system"]).size())
+
     if bt_df is None or bt_df.empty:
         print("BTトレードが0件です")
         return
@@ -537,7 +659,20 @@ def main():
     rows = []
 
     print("\n===== 実運用 vs BT 比較（手数料込み） =====\n")
-    print("期間   区分     PF     勝率    Long  Short  件数   期待値pt   損益pt   損益円")
+    print(
+    f"{'期間':>6}"
+    f"{'区分':>8}"
+    f"{'PF':>10}"
+    f"{'勝率':>10}"
+    f"{'Long①':>8}"
+    f"{'Long④':>8}"
+    f"{'Short③':>8}"
+    f"{'Short⑤':>8}"
+    f"{'件数':>8}"
+    f"{'期待値pt':>12}"
+    f"{'損益pt':>12}"
+    f"{'損益円':>14}"
+)
 
     # =========================
     # 本日
