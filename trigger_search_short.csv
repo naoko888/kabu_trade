@@ -1,9 +1,0 @@
-﻿trigger,n,win_rate,pnl,pf
-break_retest_fail,2046,30.25,-31997.0,0.6
-two_bear_bars,4909,29.35,-85868.0,0.55
-bear_bar,8835,28.94,-158855.0,0.54
-fail_rebound,6864,28.72,-125773.0,0.53
-next_open,21304,29.1,-381678.0,0.53
-break_2bar_low,5461,28.22,-104517.0,0.52
-break_prev_low,6135,28.18,-117860.0,0.52
-topfail_break,5011,27.96,-97772.0,0.51

@@ -22,7 +22,7 @@ COMMISSION_PT = COMMISSION_YEN / PT_TO_YEN
 
 MICRO_TP = 240
 MICRO_SL = 60
-TOUCH_PCT = 0.005
+TOUCH_PCT = 0.007
 MAX_HOLD = 120
 
 MICRO_MONTHLY_DD_LIMIT = -30_000  # 円
@@ -30,13 +30,13 @@ MICRO_MONTHLY_DD_LIMIT = -30_000  # 円
 # ★ 実運用コードと揃える
 S1_WEEKDAYS = (0, 1, 2)  # 月火水
 S1_HOURS_DST = (8, 15, 18, 19, 20, 21)
-S1_HOURS_WIN = (8, 12, 15, 18, 20, 21, 23)
-S1_EXCL_MONTHS = (3, 5, 11)
+S1_HOURS_WIN = (8, 12, 15, 18, 21, 23)
+S1_EXCL_MONTHS = (3, 11)
 
 S3_WEEKDAYS = (0, 2, 3, 4)  # 月水木金
-S3_EXCL_MONTHS = (5, 7, 11)
-S3_HOURS_DST = (5, 8, 12, 14, 15, 19, 20, 22, 23)
-S3_HOURS_WIN = (5, 12, 15, 19, 20, 21, 22, 23)
+S3_EXCL_MONTHS = (7, 11)
+S3_HOURS_DST = (0, 5, 8, 12, 14, 15, 19, 20, 22, 23)
+S3_HOURS_WIN = (5, 12, 15, 19, 20, 21, 22)
 
 # 系統④：逆張りロング
 SYS4_MOVE_PCT      = 0.002
@@ -64,6 +64,14 @@ SYS45_DD_LIMIT_YEN = -3000
 
 SESSION_BOUNDARIES = frozenset({2350})
 
+
+def _trading_day_sort_key(dt):
+    """取引日順ソートキー: 17:00未満は翌日扱いにして夜間→深夜→日中の順に並べる。"""
+    if dt.hour < 17:
+        return dt + pd.Timedelta(days=1)
+    return dt
+
+
 _DST_PERIODS = [
     (pd.Timestamp("2023-03-12"), pd.Timestamp("2023-11-05")),
     (pd.Timestamp("2024-03-10"), pd.Timestamp("2024-11-03")),
@@ -83,13 +91,21 @@ def is_dst(ts: pd.Timestamp) -> bool:
 
 
 def get_trade_date(ts: pd.Timestamp):
-    """
-    先物の取引日ベース
-    00:00〜05:59 は前日夜間セッションとして前日に寄せる
-    """
-    if ts.hour < 6:
-        return (ts - pd.Timedelta(days=1)).date()
-    return ts.date()
+    from datetime import timedelta
+
+    if ts.hour >= 17:
+        base_date = (ts + timedelta(days=1)).date()
+    else:
+        base_date = ts.date()
+
+    wd = base_date.weekday()
+
+    if wd == 5:
+        base_date += timedelta(days=2)
+    elif wd == 6:
+        base_date += timedelta(days=1)
+
+    return base_date
 
 
 def load_cpi():
@@ -155,6 +171,31 @@ def load_live_log():
 
     return df.sort_values("entry_time").reset_index(drop=True)
 
+DATA_DIR = Path(r"C:\kabu_trade\data")
+EXCEL_FILES = [
+    "N225microf_2023.xlsx",
+    "N225microf_2024.xlsx",
+    "N225microf_2025.xlsx",
+    "N225microf_2026.xlsx",
+]
+
+def read_excel(path: Path) -> pd.DataFrame:
+    df = pd.read_excel(path, sheet_name="5min", engine="openpyxl")
+    df = df.rename(columns={
+        "日付": "date", "時間": "time",
+        "始値": "open", "高値": "high", "安値": "low",
+        "終値": "close", "出来高": "volume",
+    })
+    df["datetime"] = pd.to_datetime(
+        df["date"].astype(str).str.strip() + " " + df["time"].astype(str).str.strip(),
+        errors="coerce",
+    )
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["datetime", "open", "high", "low", "close"]).copy()
+    df = df[["datetime", "open", "high", "low", "close", "volume"]].copy()
+    sort_keys = df["datetime"].map(_trading_day_sort_key)
+    return df.iloc[sort_keys.argsort(kind="stable")].reset_index(drop=True)
 
 # =========================
 # micro_5min.csv 読み込み
@@ -176,9 +217,10 @@ def load_micro_csv():
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
     df = df.dropna(subset=["datetime", "open", "high", "low", "close"]).copy()
-    df = df.sort_values("datetime").drop_duplicates(subset=["datetime"], keep="last").reset_index(drop=True)
+    df = df.drop_duplicates(subset=["datetime"], keep="last")
+    sort_keys = df["datetime"].map(_trading_day_sort_key)
+    df = df.iloc[sort_keys.argsort(kind="stable")].reset_index(drop=True)
     return df
-
 
 def add_indicators(df: pd.DataFrame):
     df = df.copy()
@@ -210,7 +252,8 @@ def add_indicators(df: pd.DataFrame):
 # =========================
 # BT実行
 # =========================
-def exec_trade_sys(df: pd.DataFrame, entry_idx: int, side: str, tp: int, sl: int, max_hold: int):
+def exec_trade_sys(df: pd.DataFrame, entry_idx: int, side: str, tp: int, sl: int, max_hold: int,
+                   force_session_close: bool = True, entry_weekday: int = -1):
     ep = float(df.iloc[entry_idx]["open"])
 
     for j in range(entry_idx, min(entry_idx + max_hold, len(df))):
@@ -231,10 +274,17 @@ def exec_trade_sys(df: pd.DataFrame, entry_idx: int, side: str, tp: int, sl: int
             if bhi >= ep + sl:
                 return -sl - COMMISSION_PT, dt, "SL"
 
-        if hhmm in SESSION_BOUNDARIES:
+        # 23:50強制決済（force_session_close=Trueの場合のみ）
+        if force_session_close and hhmm in SESSION_BOUNDARIES:
             close_price = float(row["close"])
             pnl = (close_price - ep) if side == "long" else (ep - close_price)
             return pnl - COMMISSION_PT, dt, "SESSION"
+
+        # 土曜に入ったら強制決済（金曜エントリーのみ）
+        if entry_weekday == 4 and dt.weekday() == 5:
+            close_price = float(row["close"])
+            pnl = (close_price - ep) if side == "long" else (ep - close_price)
+            return pnl - COMMISSION_PT, dt, "SAT_CLOSE"
 
     last_idx = min(entry_idx + max_hold - 1, len(df) - 1)
     last_row = df.iloc[last_idx]
@@ -243,13 +293,16 @@ def exec_trade_sys(df: pd.DataFrame, entry_idx: int, side: str, tp: int, sl: int
     pnl = (close_price - ep) if side == "long" else (ep - close_price)
     return pnl - COMMISSION_PT, dt, "TIME"
 
-
 def build_bt_trades(df: pd.DataFrame, cpi_df: pd.DataFrame):
     trades = []
 
     for i in range(3, len(df)):
         sig_i = i - 1   # 判定に使う確定足
         ent_i = i       # エントリー足
+
+        ent_dt = pd.Timestamp(df.iloc[ent_i]["datetime"])
+        if ent_dt.hour == 17 and ent_dt.minute == 0:
+            continue
 
         row = df.iloc[sig_i]
         row_p = df.iloc[sig_i - 1]
@@ -289,11 +342,7 @@ def build_bt_trades(df: pd.DataFrame, cpi_df: pd.DataFrame):
         gc = macd > macd_sig
 
         s1_hours = S1_HOURS_DST if is_dst(dt) else S1_HOURS_WIN
-        # ★セッションギャップ除外
-        ent_dt = pd.Timestamp(df.iloc[ent_i]["datetime"])
-        gap_min = (ent_dt - dt).total_seconds() / 60
-        
-        if gap_min <= 10 and (
+        if (
             above_ma
             and touch_lo
             and gc
@@ -311,7 +360,7 @@ def build_bt_trades(df: pd.DataFrame, cpi_df: pd.DataFrame):
                 "pnl_pt": round(pnl_pt, 4),
                 "pnl_yen": int(round(pnl_pt * PT_TO_YEN, 0)),
                 "reason": reason,
-                "trade_date": get_trade_date(entry_time),
+                "trade_date": entry_time.date(),
             })
 
         # 系統③
@@ -328,13 +377,13 @@ def build_bt_trades(df: pd.DataFrame, cpi_df: pd.DataFrame):
         ):
             s3_hours = S3_HOURS_DST if is_dst(dt) else S3_HOURS_WIN
 
-            # ★セッションギャップ除外
-            ent_dt = pd.Timestamp(df.iloc[ent_i]["datetime"])
-            gap_min = (ent_dt - dt).total_seconds() / 60
-            if gap_min > 10:
-                pass
-            elif hr_s3 in s3_hours and not is_cpi_window(dt, cpi_df):
-                pnl_pt, exit_time, reason = exec_trade_sys(df, ent_i, "short", MICRO_TP, MICRO_SL, MAX_HOLD)
+            if hr_s3 in s3_hours and not is_cpi_window(dt, cpi_df):
+                pnl_pt, exit_time, reason = exec_trade_sys(
+                df, ent_i, "short", MICRO_TP, MICRO_SL,
+                max_hold=50,
+                force_session_close=False,
+                entry_weekday=wd,
+                )
                 entry_time = pd.Timestamp(df.iloc[ent_i]["datetime"])
                 trades.append({
                     "system": "③",
@@ -344,7 +393,7 @@ def build_bt_trades(df: pd.DataFrame, cpi_df: pd.DataFrame):
                     "pnl_pt": round(pnl_pt, 4),
                     "pnl_yen": int(round(pnl_pt * PT_TO_YEN, 0)),
                     "reason": reason,
-                    "trade_date": get_trade_date(entry_time),
+                    "trade_date": entry_time.date(),
                 })
 
         # 系統④（逆張りロング）
@@ -371,7 +420,7 @@ def build_bt_trades(df: pd.DataFrame, cpi_df: pd.DataFrame):
                 "pnl_pt": round(pnl_pt, 4),
                 "pnl_yen": int(round(pnl_pt * PT_TO_YEN, 0)),
                 "reason": reason,
-                "trade_date": get_trade_date(entry_time),
+                "trade_date": entry_time.date(),
             })
 
         # 系統⑤（逆張りショート）
@@ -397,7 +446,7 @@ def build_bt_trades(df: pd.DataFrame, cpi_df: pd.DataFrame):
                 "pnl_pt": round(pnl_pt, 4),
                 "pnl_yen": int(round(pnl_pt * PT_TO_YEN, 0)),
                 "reason": reason,
-                "trade_date": get_trade_date(entry_time),
+                "trade_date": entry_time.date(),
             })
 
     if not trades:
@@ -414,29 +463,47 @@ def apply_monthly_dd(bt: pd.DataFrame):
     sorted_bt = bt.sort_values("entry_time").reset_index(drop=True).copy()
 
     keep = []
-    month_pnl = {}
-    stopped = set()
+    month_pnl_13 = {}   # 系統①③合算
+    month_pnl_45 = {}   # 系統④⑤合算
+    stopped_13 = set()
+    stopped_45 = set()
 
     for _, row in sorted_bt.iterrows():
         ym = (row["trade_date"].year, row["trade_date"].month)
+        sys = row["system"]
 
-        if ym not in month_pnl:
-            month_pnl[ym] = 0.0
+        # 月次初期化
+        if ym not in month_pnl_13:
+            month_pnl_13[ym] = 0.0
+        if ym not in month_pnl_45:
+            month_pnl_45[ym] = 0.0
 
-        if ym in stopped:
-            keep.append(False)
-            continue
+        # 系統①③
+        if sys in ("①", "③"):
+            if ym in stopped_13:
+                keep.append(False)
+                continue
+            keep.append(True)
+            month_pnl_13[ym] += float(row["pnl_yen"])
+            if month_pnl_13[ym] <= MICRO_MONTHLY_DD_LIMIT:
+                stopped_13.add(ym)
 
-        keep.append(True)
-        month_pnl[ym] += float(row["pnl_yen"])
+        # 系統④⑤
+        elif sys in ("④", "⑤"):
+            if ym in stopped_45:
+                keep.append(False)
+                continue
+            keep.append(True)
+            month_pnl_45[ym] += float(row["pnl_yen"])
+            if month_pnl_45[ym] <= SYS45_DD_LIMIT_YEN:
+                stopped_45.add(ym)
 
-        if month_pnl[ym] <= MICRO_MONTHLY_DD_LIMIT:
-            stopped.add(ym)
+        else:
+            keep.append(True)
 
     sorted_bt["keep"] = keep
     sorted_bt = sorted_bt[sorted_bt["keep"]].drop(columns=["keep"]).reset_index(drop=True)
     return sorted_bt
-
 
 # =========================
 # 集計
@@ -505,9 +572,11 @@ def make_signal_key(df):
         return set()
     tmp = df.copy()
     tmp["entry_time_5m"] = tmp["entry_time"].dt.floor("5min")
+    time_str = tmp["entry_time_5m"].dt.strftime("%H:%M")
+    key = tmp["trade_date"].astype(str) + " " + time_str
     return set(
         zip(
-            tmp["entry_time_5m"].dt.strftime("%m/%d %H:%M"),
+            key,
             tmp["system"].astype(str),
             tmp["side"].astype(str),
         )
@@ -519,7 +588,7 @@ def print_signal_list(df: pd.DataFrame):
         print("なし")
         return
     for _, r in df.sort_values("entry_time").iterrows():
-        t = r["entry_time"].strftime("%m/%d %H:%M")
+        t = f"{r['trade_date'].strftime('%m/%d')} {r['entry_time'].strftime('%H:%M')}"
         print(f"{t}  {r['system']}  {r['side']}")
 
 def print_bar_count_diff(title: str, live_df: pd.DataFrame, bt_df: pd.DataFrame):
@@ -530,7 +599,9 @@ def print_bar_count_diff(title: str, live_df: pd.DataFrame, bt_df: pd.DataFrame)
             return pd.DataFrame(columns=["bar_time", "system", "side", "count"])
 
         tmp = df.copy()
-        tmp["bar_time"] = tmp["entry_time"].dt.floor("5min")
+        tmp["bar_time"] = pd.to_datetime(
+            tmp["trade_date"].astype(str) + " " + tmp["entry_time"].dt.floor("5min").dt.strftime("%H:%M")
+        )
 
         g = (
             tmp.groupby(["bar_time", "system", "side"])
@@ -548,7 +619,7 @@ def print_bar_count_diff(title: str, live_df: pd.DataFrame, bt_df: pd.DataFrame)
         on=["bar_time", "system", "side"],
         how="outer",
         suffixes=("_live", "_bt"),
-    ).fillna(0)
+    ).fillna(0).infer_objects(copy=False)
 
     merged["count_live"] = merged["count_live"].astype(int)
     merged["count_bt"] = merged["count_bt"].astype(int)
@@ -567,12 +638,12 @@ def print_bar_count_diff(title: str, live_df: pd.DataFrame, bt_df: pd.DataFrame)
     print("\n[差分あり]")
     diff = diff.sort_values(["bar_time", "system", "side"])
     for _, r in diff.iterrows():
-        t = pd.Timestamp(r["bar_time"]).strftime("%m/%d %H:%M")
+        bar_ts = pd.Timestamp(r["bar_time"])
+        t = bar_ts.strftime('%m/%d %H:%M')
         print(
             f"  {t}  {r['system']}  {r['side']}  "
             f"実運用={r['count_live']}件  BT={r['count_bt']}件"
         )
-
 def print_match_result(title: str, live_df: pd.DataFrame, bt_df: pd.DataFrame):
     print(f"\n===== {title}のシグナル一致判定 =====")
 
@@ -585,21 +656,22 @@ def print_match_result(title: str, live_df: pd.DataFrame, bt_df: pd.DataFrame):
 
     print(f"一致: {len(matched)}件")
     for t, sys, side in matched:
-        print(f"  {t}  {sys}  {side}")
+        print(f"  {pd.Timestamp(t).strftime('%m/%d %H:%M')}  {sys}  {side}")
 
     print(f"\n実運用のみ: {len(live_only)}件")
     for t, sys, side in live_only:
-        print(f"  {t}  {sys}  {side}")
+        print(f"  {pd.Timestamp(t).strftime('%m/%d %H:%M')}  {sys}  {side}")
 
     print(f"\nBTのみ: {len(bt_only)}件")
     for t, sys, side in bt_only:
-        print(f"  {t}  {sys}  {side}")
+        print(f"  {pd.Timestamp(t).strftime('%m/%d %H:%M')}  {sys}  {side}")
 
 
-def print_metric_row(period_label: str, label: str, m: dict):
+def print_metric_row(period_label: str, label: str, m: dict, bar_count="-"):
     print(
         f"{period_label:>6}"
-        f"{label:>8}"
+        f"{label:>10}"
+        f"{str(bar_count):>12}"
         f"{m['PF']:>10.3f}"
         f"{str(m['勝率'])+'%':>10}"
         f"{m['Long①']:>8}"
@@ -614,6 +686,22 @@ def print_metric_row(period_label: str, label: str, m: dict):
 
 
 # =========================
+# XLSX全期間ロード（BT用）
+# =========================
+def load_xlsx_for_bt() -> pd.DataFrame:
+    dfs = []
+    for fname in EXCEL_FILES:
+        path = DATA_DIR / fname
+        if path.exists():
+            dfs.append(read_excel(path))
+    if not dfs:
+        return pd.DataFrame()
+    return (pd.concat(dfs, ignore_index=True)
+            .drop_duplicates(subset=["datetime"], keep="last")
+            .reset_index(drop=True))
+
+
+# =========================
 # メイン
 # =========================
 def main():
@@ -621,28 +709,30 @@ def main():
     print(f"★★★ 実行基準時刻: {now.strftime('%Y-%m-%d %H:%M:%S')} ★★★")
 
     live_df = load_live_log()
-    csv_df = load_micro_csv()
-    cpi_df = load_cpi()
+    csv_df  = load_micro_csv()
+    cpi_df  = load_cpi()
+    xlsx_df = load_xlsx_for_bt()
 
     if live_df is None or live_df.empty:
         print("実運用ログが空です")
         return
     if csv_df is None or csv_df.empty:
-        print("micro_5min.csv が空です")
+        print("データファイルが空です")
         return
 
+    csv_bar_count  = len(csv_df)
+    xlsx_bar_count = len(xlsx_df) if not xlsx_df.empty else 0
+
     # ===== 未来データカット（最重要） =====
-    csv_df = csv_df[csv_df["datetime"] <= now].copy()
 
     csv_df = add_indicators(csv_df)
-    bt_df = build_bt_trades(csv_df, cpi_df)
+    bt_df  = build_bt_trades(csv_df, cpi_df)
 
-    # ▼ここから追加（④⑤の内訳確認）
-    tmp = bt_df[bt_df["system"].isin(["④", "⑤"])].copy()
-    tmp["date"] = tmp["entry_time"].dt.date
-
-    print("\n===== ④⑤ 日別件数 =====")
-    print(tmp.groupby(["date", "system"]).size())
+    if not xlsx_df.empty:
+        xlsx_df    = add_indicators(xlsx_df)
+        bt_xlsx_df = build_bt_trades(xlsx_df, cpi_df)
+    else:
+        bt_xlsx_df = pd.DataFrame()
 
     if bt_df is None or bt_df.empty:
         print("BTトレードが0件です")
@@ -650,7 +740,9 @@ def main():
 
     # ===== 実運用 / BT も now までに制限 =====
     live_df = live_df[live_df["entry_time"] <= now].copy()
-    bt_df = bt_df[bt_df["entry_time"] <= now].copy()
+    bt_df   = bt_df[bt_df["entry_time"] <= now + pd.Timedelta(days=3)].copy()
+    if not bt_xlsx_df.empty:
+        bt_xlsx_df = bt_xlsx_df[bt_xlsx_df["entry_time"] <= now + pd.Timedelta(days=3)].copy()
 
     # ===== 取引日 =====
     today_trade_date = get_trade_date(now)
@@ -661,7 +753,8 @@ def main():
     print("\n===== 実運用 vs BT 比較（手数料込み） =====\n")
     print(
     f"{'期間':>6}"
-    f"{'区分':>8}"
+    f"{'区分':>10}"
+    f"{'使用バー数':>12}"
     f"{'PF':>10}"
     f"{'勝率':>10}"
     f"{'Long①':>8}"
@@ -678,54 +771,81 @@ def main():
     # 本日
     # =========================
     if SHOW_TODAY:
-        live_today = live_df[live_df["trade_date"] == today_trade_date].copy()
-        bt_today = bt_df[bt_df["trade_date"] == today_trade_date].copy()
+        live_today     = live_df[live_df["trade_date"].astype(str) == str(today_trade_date)].copy()
+        bt_today       = bt_df[bt_df["trade_date"].astype(str) == str(today_trade_date)].copy()
+        bt_xlsx_today  = bt_xlsx_df[bt_xlsx_df["trade_date"].astype(str) == str(today_trade_date)].copy() if not bt_xlsx_df.empty else pd.DataFrame()
 
-        live_m = calc_metrics(live_today)
-        bt_m = calc_metrics(bt_today)
-        diff_m = make_diff_row(live_m, bt_m)
+        live_m    = calc_metrics(live_today)
+        bt_m      = calc_metrics(bt_today)
+        bt_xlsx_m = calc_metrics(bt_xlsx_today)
+        diff_m    = make_diff_row(live_m, bt_m)
 
-        for label, m in [("実運用", live_m), ("BT", bt_m), ("差分", diff_m)]:
-            print_metric_row("本日", label, m)
+        for label, m, bc in [
+            ("実運用",   live_m,    "-"),
+            ("BT(CSV)",  bt_m,      csv_bar_count),
+            ("BT(XLSX)", bt_xlsx_m, xlsx_bar_count),
+            ("差分",     diff_m,    "-"),
+        ]:
+            print_metric_row("本日", label, m, bar_count=bc)
             row = {"期間": "本日", "区分": label}
             row.update(m)
             rows.append(row)
 
-        print("-" * 90)
+        print("-" * 100)
 
         # =========================
         # 昨日
         # =========================
-        live_yesterday = live_df[live_df["trade_date"] == yesterday_trade_date].copy()
-        bt_yesterday = bt_df[bt_df["trade_date"] == yesterday_trade_date].copy()
+        live_yesterday    = live_df[live_df["trade_date"].astype(str) == str(yesterday_trade_date)].copy()
+        bt_yesterday      = bt_df[bt_df["trade_date"].astype(str) == str(yesterday_trade_date)].copy()
+        bt_xlsx_yesterday = bt_xlsx_df[bt_xlsx_df["trade_date"].astype(str) == str(yesterday_trade_date)].copy() if not bt_xlsx_df.empty else pd.DataFrame()
 
-        live_m = calc_metrics(live_yesterday)
-        bt_m = calc_metrics(bt_yesterday)
-        diff_m = make_diff_row(live_m, bt_m)
+        live_m    = calc_metrics(live_yesterday)
+        bt_m      = calc_metrics(bt_yesterday)
+        bt_xlsx_m = calc_metrics(bt_xlsx_yesterday)
+        diff_m    = make_diff_row(live_m, bt_m)
 
-        for label, m in [("実運用", live_m), ("BT", bt_m), ("差分", diff_m)]:
-            print_metric_row("昨日", label, m)
+        for label, m, bc in [
+            ("実運用",   live_m,    "-"),
+            ("BT(CSV)",  bt_m,      csv_bar_count),
+            ("BT(XLSX)", bt_xlsx_m, xlsx_bar_count),
+            ("差分",     diff_m,    "-"),
+        ]:
+            print_metric_row("昨日", label, m, bar_count=bc)
             row = {"期間": "昨日", "区分": label}
             row.update(m)
             rows.append(row)
 
-        print("-" * 90)
+        print("-" * 100)
 
         # =========================
-        # シグナル
+        # シグナル時刻一覧
         # =========================
         print("\n===== 本日のシグナル時刻一覧 =====")
+        print("\n[実運用]");   print_signal_list(live_today)
+        print("\n[BT(CSV)]");  print_signal_list(bt_today)
+        print("\n[BT(XLSX)]"); print_signal_list(bt_xlsx_today)
 
-        print("\n[実運用]")
-        print_signal_list(live_today)
+        print("\n===== 昨日のシグナル時刻一覧 =====")
+        print("\n[実運用]");   print_signal_list(live_yesterday)
+        print("\n[BT(CSV)]");  print_signal_list(bt_yesterday)
+        print("\n[BT(XLSX)]"); print_signal_list(bt_xlsx_yesterday)
 
-        print("\n[BT]")
-        print_signal_list(bt_today)
+        # =========================
+        # シグナル一致判定（2セット）
+        # =========================
+        print_match_result("本日 実運用 vs BT(CSV)",  live_today,     bt_today)
+        print_match_result("本日 実運用 vs BT(XLSX)", live_today,     bt_xlsx_today)
+        print_match_result("昨日 実運用 vs BT(CSV)",  live_yesterday, bt_yesterday)
+        print_match_result("昨日 実運用 vs BT(XLSX)", live_yesterday, bt_xlsx_yesterday)
 
-        print_match_result("本日", live_today, bt_today)
-        print_match_result("昨日", live_yesterday, bt_yesterday)
-        print_bar_count_diff("本日", live_today, bt_today)
-        print_bar_count_diff("昨日", live_yesterday, bt_yesterday)
+        # =========================
+        # 同一バー件数比較（2セット）
+        # =========================
+        print_bar_count_diff("本日 実運用 vs BT(CSV)",  live_today,     bt_today)
+        print_bar_count_diff("本日 実運用 vs BT(XLSX)", live_today,     bt_xlsx_today)
+        print_bar_count_diff("昨日 実運用 vs BT(CSV)",  live_yesterday, bt_yesterday)
+        print_bar_count_diff("昨日 実運用 vs BT(XLSX)", live_yesterday, bt_xlsx_yesterday)
 
     # =========================
     # 期間比較（Now基準）
@@ -743,20 +863,64 @@ def main():
             (bt_df["entry_time"] <= now)
         ].copy()
 
-        live_m = calc_metrics(live_sub)
-        bt_m = calc_metrics(bt_sub)
-        diff_m = make_diff_row(live_m, bt_m)
+        bt_xlsx_sub = bt_xlsx_df[
+            (bt_xlsx_df["entry_time"] >= start_dt) &
+            (bt_xlsx_df["entry_time"] <= now)
+        ].copy() if not bt_xlsx_df.empty else pd.DataFrame()
 
-        for label, m in [("実運用", live_m), ("BT", bt_m), ("差分", diff_m)]:
-            print_metric_row(f"{d}日", label, m)
+        live_m    = calc_metrics(live_sub)
+        bt_m      = calc_metrics(bt_sub)
+        bt_xlsx_m = calc_metrics(bt_xlsx_sub)
+        diff_m    = make_diff_row(live_m, bt_m)
+
+        for label, m, bc in [
+            ("実運用",   live_m,    "-"),
+            ("BT(CSV)",  bt_m,      csv_bar_count),
+            ("BT(XLSX)", bt_xlsx_m, xlsx_bar_count),
+            ("差分",     diff_m,    "-"),
+        ]:
+            print_metric_row(f"{d}日", label, m, bar_count=bc)
             row = {"期間": f"{d}日", "区分": label}
             row.update(m)
             rows.append(row)
 
-        print("-" * 90)
+        print("-" * 100)
 
     out_df = pd.DataFrame(rows)
     OUT_FILE.parent.mkdir(exist_ok=True)
+
+    # =========================
+    # 年×月クロス集計
+    # =========================
+    def print_ym_cross(title: str, df: pd.DataFrame):
+        if df is None or df.empty:
+            print(f"\n{title}: データなし")
+            return
+        print(f"\n===== {title} 年×月クロス集計（損益円）=====")
+        months = list(range(1, 13))
+        df = df.copy()
+        df["year"] = df["entry_time"].dt.year
+        df["month"] = df["entry_time"].dt.month
+        print("  年    " + "".join(f"  {m:>4}月" for m in months) + "    合計")
+        print("  " + "-" * 100)
+        for yr in sorted(df["year"].unique()):
+            vals = []
+            total = 0
+            for m in months:
+                v = int(df[(df["year"] == yr) & (df["month"] == m)]["pnl_yen"].sum())
+                vals.append(f"{v:>+7,}")
+                total += v
+            print(f"  {yr}  " + "  ".join(vals) + f"  {total:>+9,}")
+
+    # 実運用デモ（先に表示）
+    print_ym_cross("実運用デモ", live_df)
+
+    # BT CSV（月次DD適用後）
+    print_ym_cross("BT CSV（月次DD適用後）", bt_df)
+
+    # BT XLSX（月次DD適用後）
+    print_ym_cross("BT XLSX（月次DD適用後）", bt_xlsx_df)
+
     out_df.to_csv(OUT_FILE, index=False, encoding="utf-8-sig")
     print(f"\n[保存] {OUT_FILE}")
 

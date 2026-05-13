@@ -1,4 +1,4 @@
-"""
+﻿"""
 backtest_system12_combined.py
 ===========================================
 系統①（long）＋ 系統③（short）合算バックテスト
@@ -35,7 +35,7 @@ CPI_CSV     = Path(r"C:\kabu_trade\economic_calendar.csv")
 TP             = 240
 SL             = 60
 MAX_HOLD       = 120
-TOUCH_PCT      = 0.005
+TOUCH_PCT      = 0.007
 COMMISSION_PT  = 2.2
 PT_TO_YEN      = 10
 
@@ -45,7 +45,7 @@ SESSION_BOUNDARIES = frozenset({2350})
 S1_WEEKDAYS = (0,1,2)
 S1_HOURS_DST  = (8, 15, 18, 19, 20, 21)
 S1_HOURS_WIN  = (8, 12, 15, 18, 20, 21, 23)
-S1_EXCL_BASE  = (3, 5, 11)
+S1_EXCL_BASE  = (3, 11)
 
 # 系統③ 条件（backtest_perfect_order.py パターン⑤ 準拠）
 # 時刻: bar START hour（+5min シフトなし）
@@ -66,6 +66,14 @@ _DST_PERIODS = [
     (pd.Timestamp("2025-03-09"), pd.Timestamp("2025-11-02")),
     (pd.Timestamp("2026-03-08"), pd.Timestamp("2026-11-01")),
 ]
+
+
+def _trading_day_sort_key(dt):
+    """取引日順ソートキー: 17:00未満は翌日扱いにして夜間→深夜→日中の順に並べる。"""
+    if dt.hour < 17:
+        return dt + pd.Timedelta(days=1)
+    return dt
+
 
 HOLIDAYS = {
     date(2023,1,3), date(2023,2,23), date(2023,3,21),
@@ -105,7 +113,9 @@ def read_excel(path: Path) -> pd.DataFrame:
     for c in ["open", "high", "low", "close", "volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.dropna(subset=["datetime", "open", "high", "low", "close"]).copy()
-    return df[["datetime", "open", "high", "low", "close", "volume"]].sort_values("datetime")
+    df = df[["datetime", "open", "high", "low", "close", "volume"]].copy()
+    sort_keys = df["datetime"].map(_trading_day_sort_key)
+    return df.iloc[sort_keys.argsort(kind="stable")].reset_index(drop=True)
 
 
 def load_data() -> pd.DataFrame:
@@ -120,29 +130,13 @@ def load_data() -> pd.DataFrame:
         print(f"  {fname}: {len(d)} 本")
         dfs.append(d)
 
-    if MICRO_CSV.exists():
-        try:
-            dc = pd.read_csv(MICRO_CSV, index_col="datetime", parse_dates=True).reset_index()
-            if dc["datetime"].dt.tz is not None:
-                dc["datetime"] = dc["datetime"].dt.tz_convert("Asia/Tokyo").dt.tz_localize(None)
-            for c in ["open", "high", "low", "close", "volume"]:
-                if c in dc.columns:
-                    dc[c] = pd.to_numeric(dc[c], errors="coerce")
-            dc = (dc.dropna(subset=["datetime", "open", "high", "low", "close"])
-                  [["datetime", "open", "high", "low", "close", "volume"]]
-                  .sort_values("datetime"))
-            print(f"  micro_5min.csv: {len(dc)} 本")
-            dfs.append(dc)
-        except Exception as e:
-            print(f"  micro_5min.csv 読み込み失敗: {e}")
-
     if not dfs:
         raise FileNotFoundError("データファイルが見つかりません")
 
-    df = (pd.concat(dfs, ignore_index=True)
-          .sort_values("datetime")
-          .drop_duplicates(subset=["datetime"])
-          .reset_index(drop=True))
+    df = pd.concat(dfs, ignore_index=True)
+    df = df.drop_duplicates(subset=["datetime"]).reset_index(drop=True)
+    sort_keys = df["datetime"].map(_trading_day_sort_key)
+    df = df.iloc[sort_keys.argsort(kind="stable")].reset_index(drop=True)
     print(f"合計: {len(df)} 本  ({df['datetime'].min()} ~ {df['datetime'].max()})\n")
     return df
 
@@ -240,7 +234,14 @@ def run_backtest(df: pd.DataFrame,
                  ma_dist_th: float = 0.003,
                  s1_weekdays=None,
                  s1_hours=None,
+                 s1_hours_dst=None,
+                 s1_hours_win=None,
                  s3_hours=None,
+                 s3_hours_dst=None,
+                 s3_hours_win=None,
+                 s3_weekdays=None,
+                 s3_weekdays_dst=None,
+                 s3_weekdays_win=None,
                  skip_holidays=False) -> pd.DataFrame:
     """
     s1_excl_months: system ① excluded months
@@ -273,8 +274,12 @@ def run_backtest(df: pd.DataFrame,
     s1_excl_set = set(s1_excl_months)
     s3_excl_set = set(S3_EXCL_MONTHS) if s3_excl_months is None else set(s3_excl_months)
     _s1_wd = set(S1_WEEKDAYS) if s1_weekdays is None else set(s1_weekdays)
-    _s1_hr = set(s1_hours) if s1_hours is not None else None
-    _s3_hr = None if s3_hours is None else set(s3_hours)
+    _s1_hr_dst = set(s1_hours_dst) if s1_hours_dst is not None else (set(s1_hours) if s1_hours is not None else set(S1_HOURS_DST))
+    _s1_hr_win = set(s1_hours_win) if s1_hours_win is not None else (set(s1_hours) if s1_hours is not None else set(S1_HOURS_WIN))
+    _s3_hr_dst = set(s3_hours_dst) if s3_hours_dst is not None else (set(s3_hours) if s3_hours is not None else set(S3_HOURS_DST))
+    _s3_hr_win = set(s3_hours_win) if s3_hours_win is not None else (set(s3_hours) if s3_hours is not None else set(S3_HOURS_WIN))
+    _s3_wd_dst = set(s3_weekdays_dst) if s3_weekdays_dst is not None else (set(s3_weekdays) if s3_weekdays is not None else set(S3_WEEKDAYS))
+    _s3_wd_win = set(s3_weekdays_win) if s3_weekdays_win is not None else (set(s3_weekdays) if s3_weekdays is not None else set(S3_WEEKDAYS))
     _holiday_dates = HOLIDAYS if skip_holidays else set()
 
     trades = []
@@ -287,7 +292,9 @@ def run_backtest(df: pd.DataFrame,
         sig_i = i - 1
         ent_i = i
 
-        # ★ここに追加
+        if arr_hour[ent_i] == 17 and arr_minute[ent_i] == 0:
+            continue
+
         if position_bars > 0:
             position_bars += 1
             if position_bars > 5:
@@ -319,7 +326,7 @@ def run_backtest(df: pd.DataFrame,
                 continue
 
         # ─── 系統① ───
-        if wd in _s1_wd and hr in (_s1_hr if _s1_hr is not None else (S1_HOURS_DST if dst_mask[sig_i] else S1_HOURS_WIN)) and mo not in s1_excl_set:
+        if wd in _s1_wd and hr in (_s1_hr_dst if dst_mask[sig_i] else _s1_hr_win) and mo not in s1_excl_set:
             ma9p  = arr_ma9[sig_i-1];  ma10p  = arr_ma10[sig_i-1]
             ma9p2 = arr_ma9[sig_i-2];  ma10p2 = arr_ma10[sig_i-2]
             c1    = arr_close[sig_i-1]; c2    = arr_close[sig_i-2]
@@ -361,11 +368,10 @@ def run_backtest(df: pd.DataFrame,
         # ─── 系統③ ───
         # bar START hour で判定（backtest_perfect_order.py パターン⑤ 準拠）
         # DST対応時間帯フィルター + CPI除外（s_strong_weekdays = 月・木）
-        # 5月は後半（16日以降）のみ
-        _s3_may_ok = (mo != 5)
-        if wd in S3_WEEKDAYS and mo not in s3_excl_set and not cpi_mask[sig_i] and _s3_may_ok:
+        _s3_may_ok = True
+        if wd in (_s3_wd_dst if dst_mask[sig_i] else _s3_wd_win) and mo not in s3_excl_set and not cpi_mask[sig_i] and _s3_may_ok:
             
-            _s3_active = _s3_hr if _s3_hr is not None else (S3_HOURS_DST if dst_mask[sig_i] else S3_HOURS_WIN)
+            _s3_active = _s3_hr_dst if dst_mask[sig_i] else _s3_hr_win
             if h_raw in _s3_active:
                 if s3_po:
                     below = (ma9 < ma20 < ma55)
@@ -679,8 +685,19 @@ def main():
     df  = add_indicators(df)
     cpi = load_cpi()
 
-    # auto_trade.py 現行条件: 系統① 月火水 / 除外月(3,5,11)
-    trades = run_backtest(df, cpi, s1_excl_months=(3, 5, 11), s1_weekdays=(0, 1, 2))
+    # 曜日全5日・月全部・PF不良時間除外（DST/冬時間個別指定）
+    trades = run_backtest(
+        df, cpi,
+        s1_excl_months=(3, 11),
+        s3_excl_months=(7, 11),
+        s1_weekdays=(0, 1, 2),
+        s1_hours_dst=(8, 15, 18, 19, 20, 21),
+        s1_hours_win=(8, 12, 15, 18, 21, 23),
+        s3_hours_dst=(0, 5, 8, 12, 14, 15, 19, 20, 22, 23),
+        s3_hours_win=(5, 12, 15, 19, 20, 21, 22),
+        s3_weekdays_dst=(0, 2, 3, 4),
+        s3_weekdays_win=(0, 2, 3, 4),
+    )
     t1 = trades[trades["system"] == "①"]
     t3 = trades[trades["system"] == "③"]
 
@@ -765,7 +782,33 @@ def main():
         s = calc_summary(active)
         print(f"  {lim_label}  {s['n']:>5}  {skipped:>7}  {months_triggered:>5}  "
               f"{s['win_rate']:>5.1f}%  {s['pnl_yen']:>+11,.0f}  {pf_str(s['pf'])}")
-        
+
+    # 5. 曜日別PF（時間除外済み・DST/冬時間別）
+    print_scenario_header("5. 曜日別PF（時間除外済み）")
+    _day_names = {0: "月曜", 1: "火曜", 2: "水曜", 3: "木曜", 4: "金曜"}
+    _wd_hdr = (
+        f"  {'曜日':>4}  "
+        f"{'件数(DST)':>9}  {'勝率%':>6}  {'損益(円)':>11}  {'PF':>7}  {'判定':>4}  │  "
+        f"{'件数(冬)':>8}  {'勝率%':>6}  {'損益(円)':>11}  {'PF':>7}  {'判定':>4}"
+    )
+    for _sys_label, _sys_sym in (("系統①", "①"), ("系統③", "③")):
+        print(f"\n=== {_sys_label} 曜日別PF（DST / 冬時間）===")
+        print(_wd_hdr)
+        _t_sys = trades[trades["system"] == _sys_sym].copy()
+        _t_sys = _add_dst_col(_t_sys)
+        _t_dst = _t_sys[_t_sys["is_dst"]]
+        _t_win = _t_sys[~_t_sys["is_dst"]]
+        for _wd in range(5):
+            _d = _t_dst[_t_dst["signal_weekday"] == _wd]
+            _w = _t_win[_t_win["signal_weekday"] == _wd]
+            _sd = calc_summary(_d)
+            _sw = calc_summary(_w)
+            _md = "-" if _sd["n"] == 0 else ("○" if _sd["pf"] >= 1.0 else "✗")
+            _mw = "-" if _sw["n"] == 0 else ("○" if _sw["pf"] >= 1.0 else "✗")
+            print(f"  {_day_names[_wd]:>4}  "
+                  f"{_sd['n']:>9}  {_sd['win_rate']:>5.1f}%  {_sd['pnl_yen']:>11,.0f}  {pf_str(_sd['pf']):>7}  {_md:>4}  │  "
+                  f"{_sw['n']:>8}  {_sw['win_rate']:>5.1f}%  {_sw['pnl_yen']:>11,.0f}  {pf_str(_sw['pf']):>7}  {_mw:>4}")
+
         # =========================
     # MA距離フィルター総当たり（Before / After）
     # =========================
@@ -1137,11 +1180,13 @@ def main():
     t3_dst_all = t3_all[t3_all["is_dst"]]
     t3_win_all = t3_all[~t3_all["is_dst"]]
 
+    print("\n=== 系統③ 全時間帯 PF一覧（DST / 冬時間）===")
     _ah_hdr = (
         f"  {'時':>3}  "
         f"{'件数(DST)':>9}  {'勝率%':>6}  {'損益(円)':>11}  {'PF':>7}  {'判定':>4}  │  "
         f"{'件数(冬)':>8}  {'勝率%':>6}  {'損益(円)':>11}  {'PF':>7}  {'判定':>4}"
     )
+    print(_ah_hdr)
 
     for hr in range(24):
         d = t3_dst_all[t3_dst_all["signal_hour"] == hr]
@@ -1151,6 +1196,11 @@ def main():
 
         md = "-" if sd["n"] == 0 else ("○" if sd["pf"] >= 1.0 else "✗")
         mw = "-" if sw["n"] == 0 else ("○" if sw["pf"] >= 1.0 else "✗")
+        if sd["n"] == 0 and sw["n"] == 0:
+            continue
+        print(f"  {hr:>3}  "
+              f"{sd['n']:>9}  {sd['win_rate']:>5.1f}%  {sd['pnl_yen']:>11,.0f}  {pf_str(sd['pf']):>7}  {md:>4}  │  "
+              f"{sw['n']:>8}  {sw['win_rate']:>5.1f}%  {sw['pnl_yen']:>11,.0f}  {pf_str(sw['pf']):>7}  {mw:>4}")
 
 
 
@@ -1306,11 +1356,13 @@ def main():
     _ah_dst = t1_ah[t1_ah["is_dst"]]
     _ah_win = t1_ah[~t1_ah["is_dst"]]
 
+    print("\n=== 系統① 全時間帯 PF一覧（DST / 冬時間）===")
     _ah_hdr = (
         f"  {'時':>3}  "
         f"{'件数(DST)':>9}  {'勝率%':>6}  {'損益(円)':>11}  {'PF':>7}  {'判定':>4}  │  "
         f"{'件数(冬)':>8}  {'勝率%':>6}  {'損益(円)':>11}  {'PF':>7}  {'判定':>4}"
     )
+    print(_ah_hdr)
     for _hr in range(24):
         _d = _ah_dst[_ah_dst["signal_hour"] == _hr]
         _w = _ah_win[_ah_win["signal_hour"] == _hr]
@@ -1320,6 +1372,9 @@ def main():
             continue
         _dm = "-" if _sd["n"] == 0 else ("○" if _sd["pf"] >= 1.0 else "✗")
         _wm = "-" if _sw["n"] == 0 else ("○" if _sw["pf"] >= 1.0 else "✗")
+        print(f"  {_hr:>3}  "
+              f"{_sd['n']:>9}  {_sd['win_rate']:>5.1f}%  {_sd['pnl_yen']:>11,.0f}  {pf_str(_sd['pf']):>7}  {_dm:>4}  │  "
+              f"{_sw['n']:>8}  {_sw['win_rate']:>5.1f}%  {_sw['pnl_yen']:>11,.0f}  {pf_str(_sw['pf']):>7}  {_wm:>4}")
 
     _dst_h_keep = [h for h in range(24)
                    if calc_summary(_ah_dst[_ah_dst["signal_hour"] == h])["pf"] >= 1.0
@@ -1547,8 +1602,6 @@ def main():
             verdict   = "✅ 採用候補" if (ok_pf and ok_stable) else "❌ 見送り"
             stable_str = "✅ 全年プラス" if ok_stable else f"❌ マイナス年: {[int(y) for y in neg_yrs]}"
 
-    print_dd_detail(trades)
-
     # スリッページ耐久性分析
     _slip_list = [0, 2, 4, 6, 8, 10, 15, 20]
     _dd_active = sim_monthly_dd(trades, -30_000)["active"].copy()
@@ -1575,6 +1628,27 @@ def main():
             _pf  = _gw / _gl if _gl > 0 else float("inf")
             _pfs = "    inf" if _pf == float("inf") else f"{_pf:7.3f}"
             print(f"  {_slip:>3}pt  {_n:>6}  {_wr:>5.1f}%  {_tot:>+12,.0f}  {_pfs}")
+
+    # =========================
+    # 全条件なし（フィルター完全排除）
+    # =========================
+    print_scenario_header("全条件なし（除外月・除外曜日・除外時間 すべてなし）")
+    trades_nofilter = run_backtest(
+        df, cpi,
+        s1_excl_months=(),
+        s3_excl_months=(),
+        s1_weekdays=(0, 1, 2, 3, 4),
+        s1_hours=tuple(range(24)),
+        s3_hours=tuple(range(24)),
+        s3_weekdays=(0, 1, 2, 3, 4),
+    )
+    print_overall(trades_nofilter)
+    print()
+    print_ym_pnl(trades_nofilter[trades_nofilter["system"] == "①"], "①全条件なし 年×月 損益(円)")
+    print()
+    print_ym_pnl(trades_nofilter[trades_nofilter["system"] == "③"], "③全条件なし 年×月 損益(円)")
+    print()
+    print_ym_count(trades_nofilter, "全条件なし 年×月 件数")
 
 def _excl_indicator_s1(t1: pd.DataFrame, releases: pd.Series,
                         before_min: int = 30, after_min: int = 60) -> pd.DataFrame:
@@ -1643,11 +1717,7 @@ def print_dd_detail(trades):
         ym = row["ym"]
         m = int(row["month"])
         d = int(row["day"])
-        limit = -15000 if m == 5 else -30000
-        # 5月は16日以降のみ対象
-        if m == 5 and d < 16:
-            keep.append(False)
-            continue
+        limit = -30000
         if ym not in monthly_pnl:
             monthly_pnl[ym] = 0.0
         if ym in stopped:
@@ -1659,7 +1729,7 @@ def print_dd_detail(trades):
             stopped.add(ym)
             dd_triggered.append((ym, monthly_pnl[ym], limit))
     print("\n" + "="*60)
-    print("  DD発動月リスト（通常-30,000円 / 5月後半-15,000円）")
+    print("  DD発動月リスト（通常-30,000円 ）")
     print("="*60)
     for ym, pnl, limit in sorted(dd_triggered):
         print(f"  {str(ym)}  累計:{pnl:>+10,.0f}円  閾値:{limit:>+8,}円")
