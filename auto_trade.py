@@ -194,7 +194,7 @@ micro_dry_day_pnl    = 0
 micro_dry_trade_log  = []
 
 # 系統①③合算 月次ドローダウン制限
-MICRO_MONTHLY_DD_LIMIT  = -30_000  # 月次損失制限（円）
+MICRO_MONTHLY_DD_LIMIT  = -30_0000  # 月次損失制限（円）
 MICRO_PT_TO_YEN         = 10       # 1pt = ¥10（マイクロ先物）
 MICRO_COMMISSION_YEN    = 22       # 往復手数料（円）= 2.2pt × ¥10
 micro_monthly_pnl       = 0.0      # 系統①③の月間累計損益（円）
@@ -1676,6 +1676,13 @@ def check_micro_entry(now, micro_board):
         # 前セッションの足: 正常なセッション跨ぎ（陳腐化ではない）→ ロックして除外
         micro_last_signal_bar_time = latest_bar_time
         log(f"[SKIP] previous_session_bar bar_dt={bar_dt.strftime('%H:%M')} session_start={session_start.strftime('%H:%M')}")
+        return
+
+    # 夜間セッション開始直後に日中足シグナルが17:00エントリーするのを防ぐ
+    # BTの "if ent_dt.hour == 17 and minute == 0: continue" と同等
+    if hhmm_now >= 1700 and bar_dt.hour < 17:
+        micro_last_signal_bar_time = latest_bar_time
+        log(f"[SKIP] night_open_daybarsignal bar_dt={bar_dt.strftime('%H:%M')} → 17:00エントリー防止")
         return
 
     bar_age_min = (now_naive - bar_dt).total_seconds() / 60
