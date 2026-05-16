@@ -25,7 +25,7 @@ MICRO_SL = 60
 TOUCH_PCT = 0.007
 MAX_HOLD = 120
 
-MICRO_MONTHLY_DD_LIMIT = -30_000  # 円
+MICRO_MONTHLY_DD_LIMIT = -30_0000  # 円
 
 # ★ 実運用コードと揃える
 S1_WEEKDAYS = (0, 1, 2)  # 月火水
@@ -818,18 +818,6 @@ def main():
 
         print("-" * 100)
 
-        # =========================
-        # シグナル時刻一覧
-        # =========================
-        print("\n===== 本日のシグナル時刻一覧 =====")
-        print("\n[実運用]");   print_signal_list(live_today)
-        print("\n[BT(CSV)]");  print_signal_list(bt_today)
-        print("\n[BT(XLSX)]"); print_signal_list(bt_xlsx_today)
-
-        print("\n===== 昨日のシグナル時刻一覧 =====")
-        print("\n[実運用]");   print_signal_list(live_yesterday)
-        print("\n[BT(CSV)]");  print_signal_list(bt_yesterday)
-        print("\n[BT(XLSX)]"); print_signal_list(bt_xlsx_yesterday)
 
         # =========================
         # シグナル一致判定（2セット）

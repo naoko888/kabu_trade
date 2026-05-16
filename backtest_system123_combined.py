@@ -45,7 +45,7 @@ SESSION_BOUNDARIES = frozenset({2350})
 S1_WEEKDAYS = (0,1,2)
 S1_HOURS_DST  = (8, 15, 18, 19, 20, 21)
 S1_HOURS_WIN  = (8, 12, 15, 18, 20, 21, 23)
-S1_EXCL_BASE  = (3, 11)
+S1_EXCL_BASE  = (3, 5, 11)
 
 # 系統③ 条件（backtest_perfect_order.py パターン⑤ 準拠）
 # 時刻: bar START hour（+5min シフトなし）
@@ -55,7 +55,7 @@ S1_EXCL_BASE  = (3, 11)
 # CPI除外: 有効（発表前30分〜後60分）
 S3_WEEKDAYS    = (0, 2, 3, 4)     # 月・水・木・金
 # 変更後
-S3_EXCL_MONTHS = (7, 11)
+S3_EXCL_MONTHS = (5, 7, 11)
 S3_HOURS_DST   = (5, 8, 12, 14, 15, 19, 20, 22, 23)  # DST期間 bar START hour
 S3_HOURS_WIN   = (5, 12, 15, 19, 20, 21, 22, 23)      # 冬時間  bar START hour
 
@@ -688,8 +688,8 @@ def main():
     # 曜日全5日・月全部・PF不良時間除外（DST/冬時間個別指定）
     trades = run_backtest(
         df, cpi,
-        s1_excl_months=(3, 11),
-        s3_excl_months=(7, 11),
+        s1_excl_months=S1_EXCL_BASE,
+        s3_excl_months=S3_EXCL_MONTHS,
         s1_weekdays=(0, 1, 2),
         s1_hours_dst=(8, 15, 18, 19, 20, 21),
         s1_hours_win=(8, 12, 15, 18, 21, 23),
@@ -731,15 +731,16 @@ def main():
         print("  " + "-" * 72)
 
     # 3. 年×月クロス集計（系統別・合算）
-    print_scenario_header("3. 年x月クロス集計 - 損益(円)")
+    print_scenario_header("3. 年x月クロス集計 - 損益(円) [月次DD -30,000円適用]")
+    trades_dd = sim_monthly_dd(trades, -30_000)["active"]
     months = list(range(1, 13))
     hdr_cross = "  年  系統  " + "".join(f"  {m:>4}月" for m in months) + "    合計"
     print(hdr_cross)
     print("  " + "-" * (len(hdr_cross) - 2))
-    for yr in sorted(trades["signal_year"].unique()):
+    for yr in sorted(trades_dd["signal_year"].unique()):
         for sys, label in (("①", "①    "), ("③", "③    "), (None, "合算  ")):
-            grp = trades[trades["signal_year"] == yr] if sys is None else \
-                  trades[(trades["signal_year"] == yr) & (trades["system"] == sys)]
+            grp = trades_dd[trades_dd["signal_year"] == yr] if sys is None else \
+                  trades_dd[(trades_dd["signal_year"] == yr) & (trades_dd["system"] == sys)]
             if len(grp) == 0 and sys is not None:
                 continue
             vals = []
@@ -752,7 +753,7 @@ def main():
         print("  " + "-" * (len(hdr_cross) - 2))
     # 全期間月合計
     for sys, label in (("①", "①全期間"), ("③", "③全期間"), (None, "合算全期")):
-        grp = trades if sys is None else trades[trades["system"] == sys]
+        grp = trades_dd if sys is None else trades_dd[trades_dd["system"] == sys]
         vals = []
         total = 0
         for m in months:

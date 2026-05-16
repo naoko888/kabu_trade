@@ -509,7 +509,8 @@ def micro_bars_to_df():
     df = pd.DataFrame(rows)
     df["datetime"] = pd.to_datetime(df["datetime"])
     df = df.drop_duplicates(subset=["datetime"], keep="last")
-    df = df.sort_values("datetime", kind="stable").reset_index(drop=True)
+    sort_keys = df["datetime"].map(_trading_day_sort_key)
+    df = df.iloc[sort_keys.argsort(kind="stable")].reset_index(drop=True)
     return df
 
 def _strip_tz(idx):
