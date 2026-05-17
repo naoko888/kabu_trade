@@ -1253,21 +1253,17 @@ def _wait_for_fill(order_id, max_retries=10, interval=1.0):
     return None
 
 
-def send_micro_sl_tp_orders(side, sl_price, tp_price):
-    """マイクロ先物の SL逆指値注文・TP指値注文を同時発注（本番モードのみ）
+def send_micro_sl_order(side, sl_price):
+    """マイクロ先物の SL逆指値成行注文を発注（本番モードのみ）
+    TP はソフトウェア監視で検知し、成行決済する。
     side: "buy" or "sell"（エントリー方向）
-    SL逆指値: エントリー反対方向で逆指値
-      SHORT(sell): SL上抜け → 買い戻し逆指値 (UnderOver=1)
-      LONG(buy):   SL下抜け → 売り逆指値    (UnderOver=2)
-    TP指値: エントリー反対方向で指値
     """
     if MICRO_DRY_RUN:
-        log("[MICRO-DRY] SL/TP発注スキップ")
-        return None, None
+        log("[MICRO-DRY] SL発注スキップ")
+        return None
 
-    # SL・TP注文はエントリーと反対売買
-    exit_side = "1" if side == "sell" else "2"   # SHORTなら買い戻し(1)、LONGなら売り(2)
-    under_over = 1 if side == "sell" else 2       # SHORT SL: 上抜け(1)、LONG SL: 下抜け(2)
+    exit_side  = "1" if side == "sell" else "2"  # SHORTなら買い戻し(1)、LONGなら売り(2)
+    under_over = 1   if side == "sell" else 2     # SHORT SL: 上抜け(1)、LONG SL: 下抜け(2)
 
     sl_body = {
         "Password":        API_PASSWORD,
@@ -1285,47 +1281,21 @@ def send_micro_sl_tp_orders(side, sl_price, tp_price):
         "FrontOrderType":  30,
         "Price":           0,
         "ReverseLimitOrder": {
-            "TriggerSec":      1,
-            "TriggerPrice":    sl_price,
-            "UnderOver":       under_over,
+            "TriggerSec":        1,
+            "TriggerPrice":      sl_price,
+            "UnderOver":         under_over,
             "AfterHitOrderType": 1,
-            "AfterHitPrice":   0,
+            "AfterHitPrice":     0,
         },
     }
-    tp_body = {
-        "Password":        API_PASSWORD,
-        "Symbol":          MICRO_SYMBOL,
-        "Exchange":        MICRO_EXCHANGE,
-        "SecurityType":    1,
-        "Side":            exit_side,
-        "CashMargin":      2,
-        "MarginTradeType": 3,
-        "DelivType":       2,
-        "FundType":        "  ",
-        "AccountType":     4,
-        "Qty":             MICRO_LOT,
-        "ExpireDay":       0,
-        "FrontOrderType":  20,
-        "Price":           tp_price,
-    }
-
-    sl_oid = tp_oid = None
 
     res = request_with_reauth("POST", "/sendorder", json_body=sl_body)
     if res:
         sl_oid = safe_json(res).get("OrderId", "")
         log(f"[OK] マイクロSL逆指値発注 OrderId:{sl_oid}  TriggerPrice:{sl_price:.0f}")
-    else:
-        log(f"[ERR] マイクロSL逆指値発注失敗 TriggerPrice:{sl_price:.0f}")
-
-    res = request_with_reauth("POST", "/sendorder", json_body=tp_body)
-    if res:
-        tp_oid = safe_json(res).get("OrderId", "")
-        log(f"[OK] マイクロTP指値発注 OrderId:{tp_oid}  Price:{tp_price:.0f}")
-    else:
-        log(f"[ERR] マイクロTP指値発注失敗 Price:{tp_price:.0f}")
-
-    return sl_oid, tp_oid
+        return sl_oid
+    log(f"[ERR] マイクロSL逆指値発注失敗 TriggerPrice:{sl_price:.0f}")
+    return None
 
 
 def cancel_micro_order(order_id):
@@ -1466,22 +1436,26 @@ def monitor_micro_dry(now, hhmm, micro_board=None, verbose=False):
 
             # ── 本番モード処理 ──
             if not MICRO_DRY_RUN:
-                if reason in ("夜間終了強制決済", "金曜夜間強制決済"):
-                    # SL/TP注文をキャンセルしてから成行決済
+                close_side = "buy" if side == "short" else "sell"
+                if reason == "TP到達":
+                    # TP: SLキャンセル → 成行利確
                     sl_oid = pos.get("sl_order_id")
-                    tp_oid = pos.get("tp_order_id")
                     if sl_oid:
                         cancel_micro_order(sl_oid)
-                    if tp_oid:
-                        cancel_micro_order(tp_oid)
-                    time.sleep(0.5)
-                    close_side = "buy" if side == "short" else "sell"
+                    time.sleep(0.3)
                     close_oid = send_micro_order(close_side)
-                    log(f"[LIVE] {prefix} 系統{sys_label} 夜間強制決済発注 OrderId:{close_oid}")
+                    log(f"[LIVE] {prefix} TP到達 → SLキャンセル+成行利確 OrderId:{close_oid}")
+                elif reason == "SL到達":
+                    # SL: ブローカー側の逆指値が自動執行済み → 追跡ログのみ
+                    log(f"[LIVE] {prefix} SL到達 検知 @ {cp:.0f} (ブローカー側自動執行済み)")
                 else:
-                    # SL/TP到達: ブローカー側の注文が自動執行済み → 追跡ログのみ
-                    log(f"[LIVE] {prefix} 系統{sys_label} {reason} 検知 @ {cp:.0f}"
-                        f"  (ブローカー側注文が自動執行済み・追加発注なし)")
+                    # 強制決済（夜間終了・金曜夜間・土曜）: SLキャンセル → 成行決済
+                    sl_oid = pos.get("sl_order_id")
+                    if sl_oid:
+                        cancel_micro_order(sl_oid)
+                    time.sleep(0.5)
+                    close_oid = send_micro_order(close_side)
+                    log(f"[LIVE] {prefix} {reason} → SLキャンセル+成行決済 OrderId:{close_oid}")
 
             # ── 共通: ログ記録・月次DD更新 ──
             micro_dry_day_pnl += pnl
@@ -1806,11 +1780,8 @@ def check_micro_entry(now, micro_board):
                             pos4["tp_price"]    = fill_price + SYS4_TP
                             log(f"[FILL] [系統④] 約定:{fill_price:.0f}"
                                 f"  SL:{pos4['sl_price']:.0f}  TP:{pos4['tp_price']:.0f}")
-                            sl_oid4, tp_oid4 = send_micro_sl_tp_orders(
-                                "buy", pos4["sl_price"], pos4["tp_price"]
-                            )
+                            sl_oid4 = send_micro_sl_order("buy", pos4["sl_price"])
                             pos4["sl_order_id"] = sl_oid4
-                            pos4["tp_order_id"] = tp_oid4
                             micro_dry_positions.append(pos4)
                             _save_positions()
 
@@ -1876,11 +1847,8 @@ def check_micro_entry(now, micro_board):
                             pos5["tp_price"]    = fill_price - SYS5_TP
                             log(f"[FILL] [系統⑤] 約定:{fill_price:.0f}"
                                 f"  SL:{pos5['sl_price']:.0f}  TP:{pos5['tp_price']:.0f}")
-                            sl_oid5, tp_oid5 = send_micro_sl_tp_orders(
-                                "sell", pos5["sl_price"], pos5["tp_price"]
-                            )
+                            sl_oid5 = send_micro_sl_order("sell", pos5["sl_price"])
                             pos5["sl_order_id"] = sl_oid5
-                            pos5["tp_order_id"] = tp_oid5
                             micro_dry_positions.append(pos5)
                             _save_positions()
 
@@ -1965,10 +1933,9 @@ def check_micro_entry(now, micro_board):
                     log(f"[FILL] 系統{sig} 約定価格:{fill_price:.0f}"
                         f"  SL:{actual_sl:.0f}  TP:{actual_tp:.0f}"
                         f"  (シグナル価格との乖離:{fill_price - cp:+.0f}pt)")
-                    sl_oid, tp_oid = send_micro_sl_tp_orders(order_side, actual_sl, actual_tp)
+                    sl_oid = send_micro_sl_order(order_side, actual_sl)
                     pos["sl_order_id"] = sl_oid
-                    pos["tp_order_id"] = tp_oid
-                    log(f"[ORDER] SL_OrderId:{sl_oid}  TP_OrderId:{tp_oid}")
+                    log(f"[ORDER] SL_OrderId:{sl_oid}")
                     micro_dry_positions.append(pos)
                     _save_positions()
 
