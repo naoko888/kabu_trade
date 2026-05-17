@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import requests
 import pandas as pd
 import numpy as np
@@ -76,7 +77,8 @@ POLL_SEC = 0.4
 DRY_RUN       = True   # True=1570もDRY（注文なし）
 MICRO_DRY_RUN = True   # True=マイクロ先物もDRY（1570と独立して制御可能）
 
-LOG_DIR = Path(r"C:\kabu_trade\logs")  # 累積ログ保存先
+LOG_DIR       = Path(r"C:\kabu_trade\logs")         # 累積ログ保存先
+OPEN_POS_FILE = Path(r"C:\kabu_trade\open_positions.json")  # 保有ポジション永続化
 
 JST = pytz.timezone("Asia/Tokyo")
 
@@ -729,6 +731,20 @@ def start_micro_ws():
     t = threading.Thread(target=run, daemon=True)
     t.start()
     log('[OK] WebSocket起動')
+
+def _save_positions():
+    with open(OPEN_POS_FILE, "w", encoding="utf-8") as f:
+        json.dump(micro_dry_positions, f, ensure_ascii=False, default=str)
+
+def _load_open_positions():
+    if not OPEN_POS_FILE.exists():
+        return []
+    with open(OPEN_POS_FILE, encoding="utf-8") as f:
+        positions = json.load(f)
+    for pos in positions:
+        if isinstance(pos.get("entry_time"), str):
+            pos["entry_time"] = datetime.fromisoformat(pos["entry_time"])
+    return positions
 
 # =========================
 # CSV品質チェック（起動時：前日データの欠損・出来高0連続確認）
@@ -1600,6 +1616,7 @@ def monitor_micro_dry(now, hhmm, micro_board=None, verbose=False):
                 log(f"[MICRO-{mode_tag}] 系統{pos.get('system','?')} {side} 保有中 @ {pos['entry_price']:.0f}  含み:{pnl:+.0f}")
 
     micro_dry_positions = still_open
+    _save_positions()
 
 
 # =========================
@@ -1774,6 +1791,7 @@ def check_micro_entry(now, micro_board):
 
                 if MICRO_DRY_RUN:
                     micro_dry_positions.append(pos4)
+                    _save_positions()
                 else:
                     oid4 = send_micro_order("buy")
                     if oid4:
@@ -1794,6 +1812,7 @@ def check_micro_entry(now, micro_board):
                             pos4["sl_order_id"] = sl_oid4
                             pos4["tp_order_id"] = tp_oid4
                             micro_dry_positions.append(pos4)
+                            _save_positions()
 
     # ===== 系統⑤：逆張りショート判定 =====
     if sys45_stopped:
@@ -1842,6 +1861,7 @@ def check_micro_entry(now, micro_board):
 
                 if MICRO_DRY_RUN:
                     micro_dry_positions.append(pos5)
+                    _save_positions()
                 else:
                     oid5 = send_micro_order("sell")
                     if oid5:
@@ -1862,6 +1882,7 @@ def check_micro_entry(now, micro_board):
                             pos5["sl_order_id"] = sl_oid5
                             pos5["tp_order_id"] = tp_oid5
                             micro_dry_positions.append(pos5)
+                            _save_positions()
 
     if not fired:
         return
@@ -1918,6 +1939,7 @@ def check_micro_entry(now, micro_board):
 
         if MICRO_DRY_RUN:
             micro_dry_positions.append(pos)
+            _save_positions()
         else:
             order_side = "sell" if side == "short" else "buy"
             oid = send_micro_order(order_side)
@@ -1948,6 +1970,7 @@ def check_micro_entry(now, micro_board):
                     pos["tp_order_id"] = tp_oid
                     log(f"[ORDER] SL_OrderId:{sl_oid}  TP_OrderId:{tp_oid}")
                     micro_dry_positions.append(pos)
+                    _save_positions()
 
 
 # =========================
@@ -1966,6 +1989,13 @@ def main():
     print(f"マイクロ: SL:{MICRO_SL} TP:{MICRO_TP}  系統①月火水×昼夜間/CPI除外なし  系統③short月水木金  系統④逆張りlong")
     print(f"系統①時間帯: DST:(8,15,18,19,20,21) 冬:(8,12,15,18,20,21,23)  系統③時間帯DST: 5/8/12/14/15/19/20/22/23時  冬: 5/12/15/19/20/21/22/23時")
     print("=" * 60)
+
+    # ── 保有ポジション復元（再起動時）──
+    micro_dry_positions = _load_open_positions()
+    if micro_dry_positions:
+        log(f"[RESUME] 保有ポジション復元: {len(micro_dry_positions)}件")
+        for p in micro_dry_positions:
+            log(f"  系統{p.get('system')} {p.get('side')} @ {p.get('entry_price')}")
 
     # ── マイクロウォームアップ（起動時に過去足を読み込む）──
     can_trade = load_micro_warmup()
