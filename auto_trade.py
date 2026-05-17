@@ -191,7 +191,9 @@ micro_last_cum_vol   = None
 micro_last_signal_bar_time = None
 
 # マイクロ DRY（系統①②③共通・リスト管理）
-micro_dry_positions  = []   # 全系統のオープンポジション一覧
+_positions_lock      = threading.Lock()  # WebSocket/メインスレッド競合防止
+SL_GAP_THRESHOLD     = 5                 # SL指値が刺さらない閾値（1tick=50円）
+micro_dry_positions  = []                # 全系統のオープンポジション一覧
 micro_dry_day_pnl    = 0
 micro_dry_trade_log  = []
 
@@ -705,6 +707,15 @@ def _ws_on_message(ws, message):
     )
     bar_time = _adjust_trading_day(bar_time)
     _update_micro_bar_ws(bar_time, price, vol_delta)
+    _ws_check_sl_tp(price)
+
+def _ws_check_sl_tp(price):
+    """WebSocketリアルタイム価格でTP・SLギャップを検知してmonitor_micro_dryを呼ぶ"""
+    if not micro_dry_positions:
+        return
+    now  = datetime.now(JST)
+    hhmm = now.hour * 100 + now.minute
+    monitor_micro_dry(now, hhmm, {"CurrentPrice": price})
 
 def _update_micro_bar_ws(bar_time, price, volume=0):
     global micro_current_bar, micro_completed_bars
@@ -1268,7 +1279,7 @@ def send_micro_sl_order(side, sl_price):
     sl_body = {
         "Password":        API_PASSWORD,
         "Symbol":          MICRO_SYMBOL,
-        "Exchange":        MICRO_EXCHANGE,
+        "Exchange":        2,              # 日通し（両セッションカバー）
         "SecurityType":    1,
         "Side":            exit_side,
         "CashMargin":      2,
@@ -1284,15 +1295,15 @@ def send_micro_sl_order(side, sl_price):
             "TriggerSec":        1,
             "TriggerPrice":      sl_price,
             "UnderOver":         under_over,
-            "AfterHitOrderType": 1,
-            "AfterHitPrice":     0,
+            "AfterHitOrderType": 2,        # 指値（日通し対応）
+            "AfterHitPrice":     sl_price,
         },
     }
 
     res = request_with_reauth("POST", "/sendorder", json_body=sl_body)
     if res:
         sl_oid = safe_json(res).get("OrderId", "")
-        log(f"[OK] マイクロSL逆指値発注 OrderId:{sl_oid}  TriggerPrice:{sl_price:.0f}")
+        log(f"[OK] マイクロSL逆指値指値発注(日通し) OrderId:{sl_oid}  TriggerPrice:{sl_price:.0f}")
         return sl_oid
     log(f"[ERR] マイクロSL逆指値発注失敗 TriggerPrice:{sl_price:.0f}")
     return None
@@ -1393,6 +1404,13 @@ def monitor_micro_dry(now, hhmm, micro_board=None, verbose=False):
 
     if not micro_dry_positions:
         return
+
+    with _positions_lock:
+        _monitor_micro_dry_inner(now, hhmm, micro_board, verbose)
+
+
+def _monitor_micro_dry_inner(now, hhmm, micro_board, verbose):
+    global micro_dry_positions, micro_dry_day_pnl, micro_dry_trade_log
 
     board = micro_board if micro_board is not None else get_micro_board()
     if not board:
