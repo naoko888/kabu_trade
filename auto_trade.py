@@ -1782,8 +1782,9 @@ def check_micro_entry(now, micro_board):
                 send_discord(f"📈 系統④ LONG @ {cp4:.0f}  SL:{sl_price:.0f}  TP:{tp_price:.0f}")
 
                 if MICRO_DRY_RUN:
-                    micro_dry_positions.append(pos4)
-                    _save_positions()
+                    with _positions_lock:
+                        micro_dry_positions.append(pos4)
+                        _save_positions()
                 else:
                     oid4 = send_micro_order("buy")
                     if oid4:
@@ -1800,8 +1801,9 @@ def check_micro_entry(now, micro_board):
                                 f"  SL:{pos4['sl_price']:.0f}  TP:{pos4['tp_price']:.0f}")
                             sl_oid4 = send_micro_sl_order("buy", pos4["sl_price"])
                             pos4["sl_order_id"] = sl_oid4
-                            micro_dry_positions.append(pos4)
-                            _save_positions()
+                            with _positions_lock:
+                                micro_dry_positions.append(pos4)
+                                _save_positions()
 
     # ===== 系統⑤：逆張りショート判定 =====
     if sys45_stopped:
@@ -1849,8 +1851,9 @@ def check_micro_entry(now, micro_board):
                 send_discord(f"📉 系統⑤ SHORT @ {cp5:.0f}  SL:{sl_price:.0f}  TP:{tp_price:.0f}")
 
                 if MICRO_DRY_RUN:
-                    micro_dry_positions.append(pos5)
-                    _save_positions()
+                    with _positions_lock:
+                        micro_dry_positions.append(pos5)
+                        _save_positions()
                 else:
                     oid5 = send_micro_order("sell")
                     if oid5:
@@ -1867,8 +1870,9 @@ def check_micro_entry(now, micro_board):
                                 f"  SL:{pos5['sl_price']:.0f}  TP:{pos5['tp_price']:.0f}")
                             sl_oid5 = send_micro_sl_order("sell", pos5["sl_price"])
                             pos5["sl_order_id"] = sl_oid5
-                            micro_dry_positions.append(pos5)
-                            _save_positions()
+                            with _positions_lock:
+                                micro_dry_positions.append(pos5)
+                                _save_positions()
 
     if not fired:
         return
@@ -1924,8 +1928,9 @@ def check_micro_entry(now, micro_board):
         send_discord(f"📈 系統{sig} {direction} @ {cp:.0f}  SL:{sl_price:.0f}  TP:{tp_price:.0f}")
 
         if MICRO_DRY_RUN:
-            micro_dry_positions.append(pos)
-            _save_positions()
+            with _positions_lock:
+                micro_dry_positions.append(pos)
+                _save_positions()
         else:
             order_side = "sell" if side == "short" else "buy"
             oid = send_micro_order(order_side)
@@ -1954,8 +1959,9 @@ def check_micro_entry(now, micro_board):
                     sl_oid = send_micro_sl_order(order_side, actual_sl)
                     pos["sl_order_id"] = sl_oid
                     log(f"[ORDER] SL_OrderId:{sl_oid}")
-                    micro_dry_positions.append(pos)
-                    _save_positions()
+                    with _positions_lock:
+                        micro_dry_positions.append(pos)
+                        _save_positions()
 
 
 # =========================
