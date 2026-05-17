@@ -1053,7 +1053,9 @@ def check_micro_signal(df):
     hr    = (dt + pd.Timedelta(minutes=5)).hour
     hr_s3 = dt.hour
 
-    # 土曜日（金曜夜間セッション後半 00:00〜05:55）はエントリー禁止
+    # 補正後weekdayでは wd==5 は発生しない（実質デッドコード）
+    # _adjust_trading_day により土曜早朝(00:00〜05:55)は wd=0 に補正されるためエントリー可能
+    # 週末持ち越し防止は monitor_micro_dry の「金曜夜間強制決済」(物理土曜05:55) が担う
     if wd == 5:
         return []
     month = dt.month
@@ -1077,7 +1079,7 @@ def check_micro_signal(df):
         #         fired.append("②")
         # 系統①: 月火水 × DST:(8,15,18,19,20,21) / 冬:(8,12,15,18,20,21,23) × 3月・5月・11月除外（7月復活）
         _s1_dst_h = is_dst(dt.to_pydatetime())
-        _s1_hours = (8, 15, 18, 19, 20, 21) if _s1_dst_h else (8, 12, 15, 18, 21, 23)
+        _s1_hours = (2, 8, 15, 18, 19, 21) if _s1_dst_h else (2, 8, 12, 13, 15, 18, 21, 23)
         if wd in (0, 1, 2) and hr in _s1_hours and month not in (3, 11):
             if micro_monthly_skip:
                 log(f"[系統①] 月次DD制限中のためスキップ ({micro_monthly_pnl:,.0f}円)")
@@ -1107,9 +1109,9 @@ def check_micro_signal(df):
 
             # DST対応時間帯フィルター
             if is_dst(now_dt):
-                s3_hours = (0, 5, 8, 12, 14, 15, 19, 20, 22, 23)
+                s3_hours = (0, 5, 8, 12, 13, 14, 15, 19, 20, 22, 23)
             else:
-                s3_hours = (5, 12, 15, 19, 20, 21, 22)
+                s3_hours = (4, 5, 15, 17, 18, 19, 20, 21, 22)
 
             if hr_s3 not in s3_hours:
                 log(

@@ -242,7 +242,8 @@ def run_backtest(df: pd.DataFrame,
                  s3_weekdays=None,
                  s3_weekdays_dst=None,
                  s3_weekdays_win=None,
-                 skip_holidays=False) -> pd.DataFrame:
+                 skip_holidays=False,
+                 s1_force_session_close: bool = True) -> pd.DataFrame:
     """
     s1_excl_months: system ① excluded months
     s3_po: if True, use 3-line PO (ma9<ma20<ma55) for system ③
@@ -347,6 +348,7 @@ def run_backtest(df: pd.DataFrame,
                     ep = arr_open[ent_i]
                     pnl, rtype = _exec(arr_high, arr_low, arr_close, arr_hm,
                                        ep, ent_i, "long", n,
+                                       force_session_close=s1_force_session_close,
                                        arr_weekday=arr_weekday)
                     pnl -= COMMISSION_PT
                     trades.append({
@@ -694,8 +696,7 @@ def main():
     # 曜日全5日・月全部・PF不良時間除外（DST/冬時間個別指定）
     # 時間帯最適化済み（optimize_hours.py → remove_hours.py による逐次スイープ）
     # 変更: ①DST +2 -20 / ①冬 +2,13 / ③DST +13 / ③冬 +4,17,18 -12
-    trades = run_backtest(
-        df, cpi,
+    _bt_kwargs = dict(
         s1_excl_months=S1_EXCL_BASE,
         s3_excl_months=S3_EXCL_MONTHS,
         s1_weekdays=(0, 1, 2),
@@ -706,6 +707,24 @@ def main():
         s3_weekdays_dst=(0, 2, 3, 4),
         s3_weekdays_win=(0, 2, 3, 4),
     )
+
+    # 系統① 23:50強制決済 ON/OFF 比較
+    print("=" * 70)
+    print("  【系統① 23:50強制決済 ON/OFF 比較】")
+    print("=" * 70)
+    print(f"  {'設定':<16}  {'PF':>6}  {'PF(DD)':>7}  {'DD発動月':>8}  {'損益円(DD)':>13}  {'件数':>6}")
+    print("  " + "-" * 65)
+    for fsc, lbl in [(True, "force_close=ON "), (False, "force_close=OFF")]:
+        _t = run_backtest(df, cpi, s1_force_session_close=fsc, **_bt_kwargs)
+        _t1 = _t[_t["system"] == "①"]
+        _s  = calc_summary(_t1)
+        _r  = sim_monthly_dd(_t1, -30_000)
+        _sd = calc_summary(_r["active"])
+        print(f"  {lbl:<16}  {_s['pf']:>6.3f}  {_sd['pf']:>7.3f}  {_r['months_triggered']:>8}  "
+              f"  {int(_sd['pnl_yen']):>+12,}  {_s['n']:>6}")
+    print()
+
+    trades = run_backtest(df, cpi, **_bt_kwargs)
     t1 = trades[trades["system"] == "①"]
     t3 = trades[trades["system"] == "③"]
 
