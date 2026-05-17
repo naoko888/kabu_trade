@@ -1432,8 +1432,11 @@ def monitor_micro_dry(now, hhmm, micro_board=None, verbose=False):
                 reason = "TP到達"
 
         if reason is None:
+            # 金曜夜間（土曜05:55）：週末持ち越し防止の強制決済
+            if now.weekday() == 5 and hhmm >= 555:
+                reason = "金曜夜間強制決済"
             # 系統③：土曜強制決済のみ（金曜エントリーの場合）
-            if pos.get("system") == "③" and pos.get("entry_weekday") == 4 and now.weekday() == 5:
+            elif pos.get("system") == "③" and pos.get("entry_weekday") == 4 and now.weekday() == 5:
                 reason = "土曜強制決済"
             # 系統①：23:50強制決済
             elif pos.get("system") == "①" and hhmm >= 2350:
@@ -1445,7 +1448,7 @@ def monitor_micro_dry(now, hhmm, micro_board=None, verbose=False):
 
             # ── 本番モード処理 ──
             if not MICRO_DRY_RUN:
-                if reason == "夜間終了強制決済":
+                if reason in ("夜間終了強制決済", "金曜夜間強制決済"):
                     # SL/TP注文をキャンセルしてから成行決済
                     sl_oid = pos.get("sl_order_id")
                     tp_oid = pos.get("tp_order_id")
@@ -1684,6 +1687,12 @@ def check_micro_entry(now, micro_board):
     if hhmm_now >= 1700 and bar_dt.hour < 17:
         micro_last_signal_bar_time = latest_bar_time
         log(f"[SKIP] night_open_daybarsignal bar_dt={bar_dt.strftime('%H:%M')} → 17:00エントリー防止")
+        return
+
+    # 金曜夜間（土曜05:00〜05:55）：週末持ち越し防止のため新規エントリー禁止
+    if now.weekday() == 5 and 500 <= hhmm_now < 600:
+        micro_last_signal_bar_time = latest_bar_time
+        log(f"[SKIP] friday_night_entry_block hhmm={hhmm_now}")
         return
 
     bar_age_min = (now_naive - bar_dt).total_seconds() / 60

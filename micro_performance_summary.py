@@ -286,6 +286,12 @@ def exec_trade_sys(df: pd.DataFrame, entry_idx: int, side: str, tp: int, sl: int
             pnl = (close_price - ep) if side == "long" else (ep - close_price)
             return pnl - COMMISSION_PT, dt, "SAT_CLOSE"
 
+        # 月曜05:55強制決済
+        if dt.weekday() == 0 and hhmm == 555:
+            close_price = float(row["close"])
+            pnl = (close_price - ep) if side == "long" else (ep - close_price)
+            return pnl - COMMISSION_PT, dt, "MON_CLOSE"
+
     last_idx = min(entry_idx + max_hold - 1, len(df) - 1)
     last_row = df.iloc[last_idx]
     dt = pd.Timestamp(last_row["datetime"])
@@ -377,7 +383,7 @@ def build_bt_trades(df: pd.DataFrame, cpi_df: pd.DataFrame):
         ):
             s3_hours = S3_HOURS_DST if is_dst(dt) else S3_HOURS_WIN
 
-            if hr_s3 in s3_hours and not is_cpi_window(dt, cpi_df):
+            if hr_s3 in s3_hours and not is_cpi_window(dt, cpi_df) and not (wd == 0 and hr_s3 == 5):
                 pnl_pt, exit_time, reason = exec_trade_sys(
                 df, ent_i, "short", MICRO_TP, MICRO_SL,
                 max_hold=50,

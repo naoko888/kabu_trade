@@ -56,7 +56,7 @@ S1_EXCL_BASE  = (3, 5, 11)
 S3_WEEKDAYS    = (0, 2, 3, 4)     # 月・水・木・金
 # 変更後
 S3_EXCL_MONTHS = (5, 7, 11)
-S3_HOURS_DST   = (5, 8, 12, 14, 15, 19, 20, 22, 23)  # DST期間 bar START hour
+S3_HOURS_DST   = (5, 8, 12, 14, 15, 19, 20, 22, 23, 0)  # DST期間 bar START hour
 S3_HOURS_WIN   = (5, 12, 15, 19, 20, 21, 22, 23)      # 冬時間  bar START hour
 
 # 米国サマータイム期間
@@ -346,7 +346,8 @@ def run_backtest(df: pd.DataFrame,
                 if above and touch and gc and ma_dist_ok and entry_ok:
                     ep = arr_open[ent_i]
                     pnl, rtype = _exec(arr_high, arr_low, arr_close, arr_hm,
-                                       ep, ent_i, "long", n)
+                                       ep, ent_i, "long", n,
+                                       arr_weekday=arr_weekday)
                     pnl -= COMMISSION_PT
                     trades.append({
                         "system":        "①",
@@ -372,7 +373,7 @@ def run_backtest(df: pd.DataFrame,
         if wd in (_s3_wd_dst if dst_mask[sig_i] else _s3_wd_win) and mo not in s3_excl_set and not cpi_mask[sig_i] and _s3_may_ok:
             
             _s3_active = _s3_hr_dst if dst_mask[sig_i] else _s3_hr_win
-            if h_raw in _s3_active:
+            if h_raw in _s3_active and not (wd == 0 and h_raw == 5):
                 if s3_po:
                     below = (ma9 < ma20 < ma55)
                 else:
@@ -385,7 +386,8 @@ def run_backtest(df: pd.DataFrame,
                     pnl, rtype = _exec(arr_high, arr_low, arr_close, arr_hm,
                                        ep, ent_i, "short", n,
                                        force_session_close=False,  # パターン⑤準拠: セッション境界強制決済なし
-                                       max_hold=50)                # パターン⑤準拠: 最大保有50本
+                                       max_hold=50,                # パターン⑤準拠: 最大保有50本
+                                       arr_weekday=arr_weekday)
                     pnl -= COMMISSION_PT
                     trades.append({
                         "system":        "③",
@@ -409,7 +411,8 @@ def run_backtest(df: pd.DataFrame,
 def _exec(arr_high, arr_low, arr_close, arr_hm,
           ep: float, ei: int, side: str, n: int,
           force_session_close: bool = True,
-          max_hold: int = MAX_HOLD):
+          max_hold: int = MAX_HOLD,
+          arr_weekday=None):
     """Trade execution kernel (inlined for performance)
     force_session_close=False: no 23:50 forced exit (matches backtest_perfect_order.py behavior)
     max_hold: max bars to hold (default MAX_HOLD=120; use 50 for system ③ パターン⑤準拠)
@@ -435,7 +438,10 @@ def _exec(arr_high, arr_low, arr_close, arr_hm,
             cl = arr_close[j]
             pnl = float(cl - ep) if side == "long" else float(ep - cl)
             rtype, exit_bar = "SESSION", j; break
-
+        if arr_weekday is not None and arr_weekday[j] == 0 and arr_hm[j] == 555:
+            cl = arr_close[j]
+            pnl = float(cl - ep) if side == "long" else float(ep - cl)
+            rtype, exit_bar = "MON_CLOSE", j; break
     if pnl is None:
         cidx = min(ei + max_hold - 1, n - 1)
         cl   = arr_close[cidx]
@@ -686,15 +692,17 @@ def main():
     cpi = load_cpi()
 
     # 曜日全5日・月全部・PF不良時間除外（DST/冬時間個別指定）
+    # 時間帯最適化済み（optimize_hours.py → remove_hours.py による逐次スイープ）
+    # 変更: ①DST +2 -20 / ①冬 +2,13 / ③DST +13 / ③冬 +4,17,18 -12
     trades = run_backtest(
         df, cpi,
         s1_excl_months=S1_EXCL_BASE,
         s3_excl_months=S3_EXCL_MONTHS,
         s1_weekdays=(0, 1, 2),
-        s1_hours_dst=(8, 15, 18, 19, 20, 21),
-        s1_hours_win=(8, 12, 15, 18, 21, 23),
-        s3_hours_dst=(0, 5, 8, 12, 14, 15, 19, 20, 22, 23),
-        s3_hours_win=(5, 12, 15, 19, 20, 21, 22),
+        s1_hours_dst=(2, 8, 15, 18, 19, 21),
+        s1_hours_win=(2, 8, 12, 13, 15, 18, 21, 23),
+        s3_hours_dst=(0, 5, 8, 12, 13, 14, 15, 19, 20, 22, 23),
+        s3_hours_win=(4, 5, 15, 17, 18, 19, 20, 21, 22),
         s3_weekdays_dst=(0, 2, 3, 4),
         s3_weekdays_win=(0, 2, 3, 4),
     )
