@@ -1265,22 +1265,26 @@ def _wait_for_fill(order_id, max_retries=10, interval=1.0):
     return None
 
 
-def send_micro_sl_order(side, sl_price):
+def send_micro_sl_order(side, sl_price, session_exchange):
     """マイクロ先物の SL逆指値成行注文を発注（本番モードのみ）
-    TP はソフトウェア監視で検知し、成行決済する。
+    TP はソフトウェア監視のみ（ブローカー注文なし）。
     side: "buy" or "sell"（エントリー方向）
+    session_exchange: 23=日中 / 24=夜間
+      ※逆指値成行は日通し(2)非対応のためセッション指定必須
     """
     if MICRO_DRY_RUN:
         log("[MICRO-DRY] SL発注スキップ")
         return None
 
-    exit_side  = "1" if side == "sell" else "2"  # SHORTなら買い戻し(1)、LONGなら売り(2)
-    under_over = 1   if side == "sell" else 2     # SHORT SL: 上抜け(1)、LONG SL: 下抜け(2)
+    # SHORTの損切=買い戻し(1)、LONGの損切=売り(2)
+    exit_side  = "1" if side == "sell" else "2"
+    # SHORT SL: 上抜けトリガー(1)、LONG SL: 下抜けトリガー(2)
+    under_over = 1   if side == "sell" else 2
 
     sl_body = {
         "Password":        API_PASSWORD,
         "Symbol":          MICRO_SYMBOL,
-        "Exchange":        2,              # 日通し（両セッションカバー）
+        "Exchange":        session_exchange,   # 23=日中 / 24=夜間（日通し不可）
         "SecurityType":    1,
         "Side":            exit_side,
         "CashMargin":      2,
@@ -1292,21 +1296,22 @@ def send_micro_sl_order(side, sl_price):
         "ExpireDay":       0,
         "FrontOrderType":  30,
         "Price":           0,
+        "TimeInForce":     2,                  # FAK（逆指値成行はFAK必須）
         "ReverseLimitOrder": {
-            "TriggerSec":        1,
+            "TriggerSec":        1,            # 約定価格でトリガー
             "TriggerPrice":      sl_price,
             "UnderOver":         under_over,
-            "AfterHitOrderType": 2,        # 指値（日通し対応）
-            "AfterHitPrice":     sl_price,
+            "AfterHitOrderType": 1,            # 成行（TPはソフト監視のみ・ブローカー注文なし）
+            "AfterHitPrice":     0,
         },
     }
 
     res = request_with_reauth("POST", "/sendorder", json_body=sl_body)
     if res:
         sl_oid = safe_json(res).get("OrderId", "")
-        log(f"[OK] マイクロSL逆指値指値発注(日通し) OrderId:{sl_oid}  TriggerPrice:{sl_price:.0f}")
+        log(f"[OK] マイクロSL逆指値成行発注(Exchange:{session_exchange}) OrderId:{sl_oid}  TriggerPrice:{sl_price:.0f}")
         return sl_oid
-    log(f"[ERR] マイクロSL逆指値発注失敗 TriggerPrice:{sl_price:.0f}")
+    log(f"[ERR] マイクロSL逆指値成行発注失敗 TriggerPrice:{sl_price:.0f}")
     return None
 
 
@@ -1321,6 +1326,32 @@ def cancel_micro_order(order_id):
         return True
     log(f"[WARN] 注文キャンセル失敗 OrderId:{order_id}")
     return False
+
+
+def _replace_sl_orders(session_exchange):
+    """セッション切り替え時に既存SL（逆指値成行）をキャンセルして新セッションで再発注。
+    session_exchange: 23=日中 / 24=夜間
+    TP はブローカー注文なし・ソフト監視のみのため対象外。
+    """
+    if MICRO_DRY_RUN:
+        return
+    with _positions_lock:
+        log(f"[SL-REPLACE] 対象: {len(micro_dry_positions)}件")
+        for pos in micro_dry_positions:
+            log(f"  系統{pos.get('system')} {pos.get('side')} "
+                f"entry:{pos.get('entry_price'):.0f} "
+                f"SL:{pos.get('sl_price'):.0f}(OrderId:{pos.get('sl_order_id')}) "
+                f"TP:{pos.get('tp_price'):.0f}(ソフト監視のみ)")
+            old_sl = pos.get("sl_order_id")
+            if old_sl:
+                cancel_micro_order(old_sl)
+                time.sleep(0.3)
+            # SHORTポジション→買い戻しSL、LONGポジション→売りSL
+            order_side = "sell" if pos.get("side") == "short" else "buy"
+            new_sl = send_micro_sl_order(order_side, pos["sl_price"], session_exchange)
+            pos["sl_order_id"] = new_sl
+            log(f"  → 新SL発注 Exchange:{session_exchange} OrderId:{new_sl}")
+        _save_positions()
 
 
 # =========================
@@ -1677,6 +1708,9 @@ def check_micro_entry(now, micro_board):
     bar_dt    = pd.Timestamp(latest_bar_time).to_pydatetime()
 
     hhmm_now = now_naive.hour * 100 + now_naive.minute
+    # SL発注先セッション: 夜間(17:00〜翌6:00)・日中終了後(15:40〜16:59) → 24、それ以外 → 23
+    # ※session_startとは用途が異なる（バー判定は既存ロジックのまま）
+    session_exchange = 24 if (hhmm_now >= 1540 or hhmm_now < 600) else 23
     if hhmm_now >= 1700:
         # 夜間セッション（17:00〜）
         session_start = now_naive.replace(hour=17, minute=0, second=0, microsecond=0)
@@ -1800,7 +1834,7 @@ def check_micro_entry(now, micro_board):
                             pos4["tp_price"]    = fill_price + SYS4_TP
                             log(f"[FILL] [系統④] 約定:{fill_price:.0f}"
                                 f"  SL:{pos4['sl_price']:.0f}  TP:{pos4['tp_price']:.0f}")
-                            sl_oid4 = send_micro_sl_order("buy", pos4["sl_price"])
+                            sl_oid4 = send_micro_sl_order("buy", pos4["sl_price"], session_exchange)
                             pos4["sl_order_id"] = sl_oid4
                             with _positions_lock:
                                 micro_dry_positions.append(pos4)
@@ -1869,7 +1903,7 @@ def check_micro_entry(now, micro_board):
                             pos5["tp_price"]    = fill_price - SYS5_TP
                             log(f"[FILL] [系統⑤] 約定:{fill_price:.0f}"
                                 f"  SL:{pos5['sl_price']:.0f}  TP:{pos5['tp_price']:.0f}")
-                            sl_oid5 = send_micro_sl_order("sell", pos5["sl_price"])
+                            sl_oid5 = send_micro_sl_order("sell", pos5["sl_price"], session_exchange)
                             pos5["sl_order_id"] = sl_oid5
                             with _positions_lock:
                                 micro_dry_positions.append(pos5)
@@ -1957,7 +1991,7 @@ def check_micro_entry(now, micro_board):
                     log(f"[FILL] 系統{sig} 約定価格:{fill_price:.0f}"
                         f"  SL:{actual_sl:.0f}  TP:{actual_tp:.0f}"
                         f"  (シグナル価格との乖離:{fill_price - cp:+.0f}pt)")
-                    sl_oid = send_micro_sl_order(order_side, actual_sl)
+                    sl_oid = send_micro_sl_order(order_side, actual_sl, session_exchange)
                     pos["sl_order_id"] = sl_oid
                     log(f"[ORDER] SL_OrderId:{sl_oid}")
                     with _positions_lock:
@@ -2006,14 +2040,23 @@ def main():
         return
     start_micro_ws()
 
+    # ── 起動時SL再発注（保有ポジションがある場合）──
+    # セッション切り替えをまたいで再起動した場合に備え、正しいExchangeでSLを投入
+    if micro_dry_positions and not MICRO_DRY_RUN:
+        _startup_hhmm = datetime.now(JST).hour * 100 + datetime.now(JST).minute
+        _startup_exch = 24 if (_startup_hhmm >= 1540 or _startup_hhmm < 600) else 23
+        log(f"[SL-REPLACE] 起動時 保有ポジションのSL再発注 Exchange={_startup_exch}")
+        _replace_sl_orders(_startup_exch)
+
     _now = datetime.now(JST)
     _hhmm = _now.hour * 100 + _now.minute
     if not (900 <= _hhmm < 1130 or 1230 <= _hhmm < 1530):
         etf_closed_today = True
 
-    last_csv_min       = -1
-    last_micro_csv_min = -1
-    last_verbose_min   = -1   # 間引きログ用（5分ごとのみ出力）
+    last_csv_min         = -1
+    last_micro_csv_min   = -1
+    last_verbose_min     = -1   # 間引きログ用（5分ごとのみ出力）
+    last_sl_replace_hhmm = -1   # SL再発注の重複実行防止
 
     while True:
         now     = datetime.now(JST)
@@ -2111,6 +2154,19 @@ def main():
             monitor_micro_dry(now, hhmm, micro_board, verbose=verbose)
             # シグナル判定（マイクロは昼休みなし・8:45〜翌5:55通し）
             check_micro_entry(now, micro_board)
+
+        # ── SL注文セッション切り替え（1回のみ発火）──
+        # 日中終了後(15:40)〜夜間前気配(16:45)の時点で夜間SLを事前投入
+        # 夜間終了後(6:00)〜日中開始(8:45)の時点で日中SLを投入
+        if not MICRO_DRY_RUN and micro_dry_positions:
+            if hhmm == 1645 and last_sl_replace_hhmm != 1645:
+                log("[SL-REPLACE] 夜間セッション前気配 → SL再発注 Exchange=24")
+                _replace_sl_orders(24)
+                last_sl_replace_hhmm = 1645
+            elif hhmm == 845 and last_sl_replace_hhmm != 845:
+                log("[SL-REPLACE] 日中セッション開始 → SL再発注 Exchange=23")
+                _replace_sl_orders(23)
+                last_sl_replace_hhmm = 845
 
         # ── 昼休み（1570のみ）──
         if 1130 <= hhmm < 1230:
