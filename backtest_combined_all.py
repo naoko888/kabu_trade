@@ -11,6 +11,22 @@ import numpy as np
 import backtest_system123_combined as bt13
 import backtest_system45_combined  as bt45
 
+# ======================================================
+# 系統⑥ トグル
+USE_SYSTEM6 = False  # ⑥スリッページ耐性不足（10pt PF=0.894）のため除外
+DD_6        = -30_000
+
+# 【系統④ 見直し履歴】
+# 更新日: 2026-05-21
+# 経緯: 旧設定でPF=1.154と低く、系統⑤(PF=1.300)と乖離が大きかった。
+#       目標: PF≥1.3、件数=⑤の半分程度(~6,000件)、スリッページ10pt耐性(PF≥1.0)
+# 旧設定: move_pct=0.0003, tp=300, max_hold=6, 時間帯=0-5+14-17+23時, 除外月=(1,7)
+#   → PF=1.154, 件数=4,331, 10pt slip PF=0.970（目標未達）
+# 新設定: move_pct=0.0001, tp=400, max_hold=8, 時間帯=14-17+23時のみ, 除外月=(7,)
+#   → PF=1.491, 件数=5,015, 10pt slip PF=1.061（全目標クリア）
+#   パラメータ実体: backtest_system45_combined.py の LONG_PARAM / S4_HOURS_* / S4_EXCL_MONTHS
+# ======================================================
+
 # ====================================================
 # ①③ の確定設定（backtest_system123_combined.py の _bt_kwargs と完全一致）
 # ====================================================
@@ -34,6 +50,16 @@ BT45_KWARGS = dict(
     use_vol      = bt45.USE_VOL,
     use_rsi      = bt45.USE_RSI,
     use_move     = bt45.USE_MOVE,
+)
+
+BT6_KWARGS = dict(
+    adx_th       = 25.0,
+    bb_width_th  = 0.030,
+    tp           = 200,
+    sl           = 80,
+    max_hold     = 6,
+    s6_hours_dst = (3, 4, 9, 10, 14, 15, 16, 18, 22, 23),
+    s6_hours_win = (3, 4, 9, 10, 14, 15, 16, 18, 22, 23),
 )
 
 PT_TO_YEN = 10
@@ -164,6 +190,7 @@ def sim_monthly_dd(trades, dd_limit, use_exit_month=False):
         "active":           df[df["keep"]].drop(columns=["ym","keep"]),
         "skipped":          int((~df["keep"]).sum()),
         "months_triggered": len(triggered),
+        "triggered_yms":    sorted(triggered),
     }
 
 
@@ -189,6 +216,14 @@ def main():
     print("④⑤ バックテスト実行中...")
     trades45 = bt45.run_backtest(df45, cpi45, **BT45_KWARGS)
 
+    if USE_SYSTEM6:
+        import backtest_system6 as bt6
+        print("\n【⑥】データ読み込み中...")
+        df6  = bt6.add_indicators(bt6.load_data())
+        cpi6 = bt6.load_cpi()
+        print("⑥ バックテスト実行中...")
+        trades6 = bt6.run_backtest(df6, cpi6, **BT6_KWARGS)
+
     # ── 決済月算出（USE_SETTLEMENT_MONTH=True 時のみ）──
     if USE_SETTLEMENT_MONTH:
         print("決済月算出中（①③）...")
@@ -203,12 +238,17 @@ def main():
         common = common + ["exit_dt"]
     t13 = trades13[common].copy()
     t45 = trades45[common].copy()
-    all_trades = pd.concat([t13, t45], ignore_index=True).sort_values("signal_dt").reset_index(drop=True)
+    parts = [t13, t45]
+    if USE_SYSTEM6:
+        t6_raw = trades6[common].copy()
+        parts.append(t6_raw)
+    all_trades = pd.concat(parts, ignore_index=True).sort_values("signal_dt").reset_index(drop=True)
 
     t1 = all_trades[all_trades["system"] == "①"]
     t3 = all_trades[all_trades["system"] == "③"]
     t4 = all_trades[all_trades["system"] == "④"]
     t5 = all_trades[all_trades["system"] == "⑤"]
+    t6 = all_trades[all_trades["system"] == "⑥"] if USE_SYSTEM6 else pd.DataFrame(columns=all_trades.columns)
 
     # ============================================================
     print(f"\n{SEP80}")
@@ -216,7 +256,11 @@ def main():
     print(SEP80)
     print(f"  {'':10}  {'件数':>6}  {'勝率%':>6}  {'損益(pt)':>12}  {'損益(円)':>13}  {'期待値':>8}  {'PF':>7}")
     print("  " + SEP72)
-    for lbl, t in [("系統①", t1), ("系統③", t3), ("系統④", t4), ("系統⑤", t5), ("合算", all_trades)]:
+    sys_rows = [("系統①", t1), ("系統③", t3), ("系統④", t4), ("系統⑤", t5)]
+    if USE_SYSTEM6:
+        sys_rows.append(("系統⑥", t6))
+    sys_rows.append(("合算", all_trades))
+    for lbl, t in sys_rows:
         print_summary_row(lbl, calc_summary(t))
 
     # ============================================================
@@ -226,7 +270,11 @@ def main():
     print(f"  {'':16}  {'件数':>6}  {'勝率%':>6}  {'損益(pt)':>12}  {'損益(円)':>13}  {'期待値':>8}  {'PF':>7}")
     print("  " + SEP72)
     for yr in sorted(all_trades["signal_year"].unique()):
-        for lbl, t in [("系統①", t1), ("系統③", t3), ("系統④", t4), ("系統⑤", t5), ("合算", all_trades)]:
+        yr_rows = [("系統①", t1), ("系統③", t3), ("系統④", t4), ("系統⑤", t5)]
+        if USE_SYSTEM6:
+            yr_rows.append(("系統⑥", t6))
+        yr_rows.append(("合算", all_trades))
+        for lbl, t in yr_rows:
             ty = t[t["signal_year"] == yr]
             s  = calc_summary(ty)
             if s["n"] == 0: continue
@@ -244,7 +292,15 @@ def main():
     res45_i    = sim_monthly_dd(t45_all, DD_45)
     active13_i = res13_i["active"]
     active45_i = res45_i["active"]
-    active_indiv = pd.concat([active13_i, active45_i]).sort_values("signal_dt").reset_index(drop=True)
+    indiv_parts = [active13_i, active45_i]
+    if USE_SYSTEM6:
+        res6_i    = sim_monthly_dd(t6.sort_values("signal_dt"), DD_6)
+        active6_i = res6_i["active"]
+        indiv_parts.append(active6_i)
+    else:
+        res6_i    = {"active": pd.DataFrame(columns=t1.columns), "skipped": 0, "months_triggered": 0}
+        active6_i = res6_i["active"]
+    active_indiv = pd.concat(indiv_parts).sort_values("signal_dt").reset_index(drop=True)
 
     # 合算DD（参照用）
     DD_LIMIT = -30_000
@@ -254,113 +310,77 @@ def main():
     a3 = active[active["system"] == "③"]
     a4 = active[active["system"] == "④"]
     a5 = active[active["system"] == "⑤"]
+    a6 = active[active["system"] == "⑥"] if USE_SYSTEM6 else pd.DataFrame(columns=active.columns)
 
     # ============================================================
     months = list(range(1, 13))
 
-    def print_cross_table(label, trades_list, dd_label):
-        print(f"\n{SEP80}")
-        print(f"  3. 年x月クロス集計 - 損益(円)（{dd_label}）")
-        print(SEP80)
-        hdr = "  年  系統  " + "".join(f"  {m:>5}月" for m in months) + "     合計"
-        print(hdr)
-        print("-" * len(hdr))
-        all_t = pd.concat([t for _, t in trades_list])
-        for yr in sorted(all_t["signal_year"].unique()):
-            for sys_lbl, t in trades_list + [("合", all_t)]:
-                ty = t[t["signal_year"] == yr]
-                vals = [f"{int(ty[ty['signal_month']==mo]['pnl_yen'].sum()):>+7,}"
-                        if ty[ty['signal_month']==mo]['pnl_yen'].sum() != 0 else "      -"
-                        for mo in months]
-                print(f"  {yr}  {sys_lbl:>2}   " + "  ".join(vals) + f"  {int(ty['pnl_yen'].sum()):>+9,}")
-            print()
+    s6_tag = "+⑥" if USE_SYSTEM6 else ""
 
-    print_cross_table("①③", [("①", active13_i[active13_i["system"]=="①"]),
-                               ("③", active13_i[active13_i["system"]=="③"])],
-                      f"①③ 月次DD {DD_13:,}円")
-    print_cross_table("④⑤", [("④", active45_i[active45_i["system"]=="④"]),
-                               ("⑤", active45_i[active45_i["system"]=="⑤"])],
-                      f"④⑤ 月次DD {DD_45:,}円")
-
-    # ── 合算月次累積損益（セクション3と同じグリッド形式）──
-    print(f"\n  【①③+④⑤ 月次累積損益（個別DD適用後）】")
-    hdr2 = "  年  系統  " + "".join(f"  {m:>5}月" for m in months) + "     合計     累積"
-    print(hdr2)
-    print("-" * len(hdr2))
-    cumulative = 0
-    for yr in sorted(active_indiv["signal_year"].unique()):
-        rows = {
-            "①③": active13_i[active13_i["signal_year"]==yr],
-            "④⑤": active45_i[active45_i["signal_year"]==yr],
-            "合":  active_indiv[active_indiv["signal_year"]==yr],
-        }
-        yr_total = 0
-        for sys_lbl, t in rows.items():
-            vals = []
-            for mo in months:
-                v = int(t[t["signal_month"]==mo]["pnl_yen"].sum())
-                vals.append(f"{v:>+7,}" if v != 0 else "      -")
-            total = int(t["pnl_yen"].sum())
-            if sys_lbl == "合":
-                cumulative += total
-                print(f"  {yr}  {sys_lbl:>2}   " + "  ".join(vals) + f"  {total:>+9,}  {cumulative:>+9,}")
-            else:
-                print(f"  {yr}  {sys_lbl:>2}   " + "  ".join(vals) + f"  {total:>+9,}")
-        print()
-
-    # ── 合算DD -30,000 版 ──
-    print(f"\n  【①③+④⑤ 月次累積損益（合算DD -30,000円適用後）】")
-    hdr3 = "  年  系統  " + "".join(f"  {m:>5}月" for m in months) + "     合計     累積"
+    # ── 合算DD版 ──
+    print(f"\n  【①③+④⑤{s6_tag} 月次累積損益（合算DD {DD_LIMIT:,}円適用後）】")
+    hdr3 = "  年  系統  " + "".join(f"  {m:>5}月" for m in months) + "     合計       PF     累積"
     print(hdr3)
     print("-" * len(hdr3))
 
     a_comb = res_dd["active"]
     ac13 = a_comb[a_comb["system"].isin(["①","③"])]
     ac45 = a_comb[a_comb["system"].isin(["④","⑤"])]
+    ac6  = a_comb[a_comb["system"] == "⑥"] if USE_SYSTEM6 else pd.DataFrame(columns=a_comb.columns)
 
     cumulative2 = 0
     for yr in sorted(a_comb["signal_year"].unique()):
-        rows2 = {
-            "①③": ac13[ac13["signal_year"]==yr],
-            "④⑤": ac45[ac45["signal_year"]==yr],
-            "合":  a_comb[a_comb["signal_year"]==yr],
-        }
+        rows2 = {"①③": ac13[ac13["signal_year"]==yr],
+                 "④⑤": ac45[ac45["signal_year"]==yr]}
+        if USE_SYSTEM6:
+            rows2["⑥"] = ac6[ac6["signal_year"]==yr]
+        rows2["合"] = a_comb[a_comb["signal_year"]==yr]
         for sys_lbl, t in rows2.items():
             vals = []
             for mo in months:
                 v = int(t[t["signal_month"]==mo]["pnl_yen"].sum())
                 vals.append(f"{v:>+7,}" if v != 0 else "      -")
             total = int(t["pnl_yen"].sum())
+            pf_val = pf_s(calc_summary(t)["pf"])
             if sys_lbl == "合":
                 cumulative2 += total
-                print(f"  {yr}  {sys_lbl:>2}   " + "  ".join(vals) + f"  {total:>+9,}  {cumulative2:>+9,}")
+                print(f"  {yr}  {sys_lbl:>2}   " + "  ".join(vals) + f"  {total:>+9,}  {pf_val:>6}  {cumulative2:>+9,}")
             else:
-                print(f"  {yr}  {sys_lbl:>2}   " + "  ".join(vals) + f"  {total:>+9,}")
+                print(f"  {yr}  {sys_lbl:>2}   " + "  ".join(vals) + f"  {total:>+9,}  {pf_val:>6}")
         print()
 
     # ============================================================
     print(f"\n{SEP80}")
-    print(f"  4. 年別PF（月次DD {DD_LIMIT:,}円適用）")
+    print(f"  4. 年別PF（合算DD {DD_LIMIT:,}円適用）")
     print(SEP80)
+    s6_hdr = f"  {'⑥N':>5} {'⑥PF':>6}" if USE_SYSTEM6 else ""
+    sep_w  = 103 if USE_SYSTEM6 else 90
     print(f"\n  {'年':>6}  {'①N':>5} {'①PF':>6}  {'③N':>5} {'③PF':>6}  "
-          f"{'④N':>5} {'④PF':>6}  {'⑤N':>5} {'⑤PF':>6}  {'合N':>6} {'合PF':>7}  {'合損益(円)':>13}")
-    print("  " + "-" * 90)
+          f"{'④N':>5} {'④PF':>6}  {'⑤N':>5} {'⑤PF':>6}{s6_hdr}  {'合N':>6} {'合PF':>7}  {'合損益(円)':>13}")
+    print("  " + "-" * sep_w)
     for yr in sorted(active["signal_year"].unique()):
         r1 = calc_summary(a1[a1["signal_year"] == yr])
         r3 = calc_summary(a3[a3["signal_year"] == yr])
         r4 = calc_summary(a4[a4["signal_year"] == yr])
         r5 = calc_summary(a5[a5["signal_year"] == yr])
+        r6 = calc_summary(a6[a6["signal_year"] == yr]) if USE_SYSTEM6 else None
         ra = calc_summary(active[active["signal_year"] == yr])
+        s6c = f"  {r6['n']:>5} {pf_s(r6['pf']):>6}" if USE_SYSTEM6 else ""
         print(f"  {yr:>6}  {r1['n']:>5} {pf_s(r1['pf']):>6}  {r3['n']:>5} {pf_s(r3['pf']):>6}  "
-              f"{r4['n']:>5} {pf_s(r4['pf']):>6}  {r5['n']:>5} {pf_s(r5['pf']):>6}  "
+              f"{r4['n']:>5} {pf_s(r4['pf']):>6}  {r5['n']:>5} {pf_s(r5['pf']):>6}{s6c}  "
               f"{ra['n']:>6} {pf_s(ra['pf']):>7}  {ra['pnl_yen']:>+13,}")
-    print("  " + "-" * 90)
+    print("  " + "-" * sep_w)
     r1a = calc_summary(a1); r3a = calc_summary(a3)
-    r4a = calc_summary(a4); r5a = calc_summary(a5); raa = calc_summary(active)
+    r4a = calc_summary(a4); r5a = calc_summary(a5)
+    r6a = calc_summary(a6) if USE_SYSTEM6 else None
+    raa = calc_summary(active)
+    s6t = f"  {r6a['n']:>5} {pf_s(r6a['pf']):>6}" if USE_SYSTEM6 else ""
     print(f"  {'全期間':>6}  {r1a['n']:>5} {pf_s(r1a['pf']):>6}  {r3a['n']:>5} {pf_s(r3a['pf']):>6}  "
-          f"{r4a['n']:>5} {pf_s(r4a['pf']):>6}  {r5a['n']:>5} {pf_s(r5a['pf']):>6}  "
+          f"{r4a['n']:>5} {pf_s(r4a['pf']):>6}  {r5a['n']:>5} {pf_s(r5a['pf']):>6}{s6t}  "
           f"{raa['n']:>6} {pf_s(raa['pf']):>7}  {raa['pnl_yen']:>+13,}")
     print(f"  スキップ: {res_dd['skipped']}件  DD発動月: {res_dd['months_triggered']}ヶ月")
+    if res_dd["triggered_yms"]:
+        print("  DD発動月: " + "  ".join(f"{y}/{m:02d}" for y, m in res_dd["triggered_yms"]))
 
     # ============================================================
     print(f"\n{SEP80}")
@@ -369,6 +389,7 @@ def main():
     limits = [None, -20_000, -30_000, -40_000, -50_000, -60_000]
     print(f"\n  {'制限(円)':>12}  {'件数':>6}  {'スキップ':>8}  {'発動月':>6}  {'勝率%':>6}  {'損益(円)':>13}  {'PF':>7}")
     print("  " + "-" * 72)
+    res_dd_30k = None
     for lim in limits:
         if lim is None:
             s = calc_summary(all_trades)
@@ -379,26 +400,37 @@ def main():
             s   = calc_summary(res["active"])
             print(f"  {lim:>+12,}  {s['n']:>6}  {res['skipped']:>8}  {res['months_triggered']:>6}  "
                   f"{s['win_rate']:>5.1f}%  {s['pnl_yen']:>+13,}  {pf_s(s['pf']):>7}")
+            if lim == -60_000:
+                res_dd_30k = res_dd  # DD_LIMIT行のDD発動月を表示
+    if res_dd_30k and res_dd_30k["triggered_yms"]:
+        print("  DD発動月（合算DD): " + "  ".join(f"{y}/{m:02d}" for y, m in res_dd_30k["triggered_yms"]))
 
-    # ── DD -30,000 後の系統別件数内訳 ──
-    print(f"\n  系統別件数内訳（月次DD {DD_LIMIT:,}円適用後）")
+    # ── 合算DD後の系統別件数内訳 ──
+    print(f"\n  系統別件数内訳（合算DD {DD_LIMIT:,}円適用後）")
     print(f"  {'系統':>6}  {'DD前':>6}  {'DD後':>6}  {'スキップ':>8}  {'勝率%':>6}  {'損益(円)':>13}  {'PF':>7}")
     print("  " + "-" * 62)
-    for sys_lbl, bf, af in [("①", t1, a1), ("③", t3, a3), ("④", t4, a4), ("⑤", t5, a5),
-                             ("合算", all_trades, active)]:
+    breakdown = [("①", t1, a1), ("③", t3, a3), ("④", t4, a4), ("⑤", t5, a5)]
+    if USE_SYSTEM6:
+        breakdown.append(("⑥", t6, a6))
+    breakdown.append(("合算", all_trades, active))
+    for sys_lbl, bf, af in breakdown:
         sb = calc_summary(bf); sa = calc_summary(af)
         skip = sb["n"] - sa["n"]
         print(f"  {sys_lbl:>6}  {sb['n']:>6}  {sa['n']:>6}  {skip:>8}  "
               f"{sa['win_rate']:>5.1f}%  {sa['pnl_yen']:>+13,}  {pf_s(sa['pf']):>7}")
 
-    print(f"\n  系統別個別DD適用後の合算（①③: {DD_13:,}円 / ④⑤: {DD_45:,}円）")
+    s6_dd_label = f" / ⑥: {DD_6:,}円" if USE_SYSTEM6 else ""
+    print(f"\n  系統別個別DD適用後の合算（①③: {DD_13:,}円 / ④⑤: {DD_45:,}円{s6_dd_label}）")
     print(f"  {'系統':>8}  {'DD前':>6}  {'DD後':>6}  {'スキップ':>8}  {'勝率%':>6}  {'損益(円)':>13}  {'PF':>7}")
     print("  " + "-" * 66)
-    for lbl, bf, af, res in [
+    indiv_list = [
         ("①③", t13_all, active13_i, res13_i),
         ("④⑤", t45_all, active45_i, res45_i),
-        ("合算", all_trades, active_indiv, None),
-    ]:
+    ]
+    if USE_SYSTEM6:
+        indiv_list.append(("⑥",   t6,      active6_i,  res6_i))
+    indiv_list.append(("合算", all_trades, active_indiv, None))
+    for lbl, bf, af, res in indiv_list:
         sb = calc_summary(bf); sa = calc_summary(af)
         skip = sb["n"] - sa["n"]
         mo_str = f"発動月:{res['months_triggered']}" if res else ""
@@ -415,12 +447,17 @@ def main():
     print(SEP80)
     slips = [0, 2, 4, 6, 8, 10, 15, 20]
 
-    for grp_lbl, grp, dd_lbl in [
-        ("①③④⑤ 合算DD", active,       f"合算DD {DD_LIMIT:,}円"),
-        ("①③④⑤ 個別DD", active_indiv, f"①③{DD_13:,} / ④⑤{DD_45:,}"),
-        ("①③",          active13_i,   f"DD {DD_13:,}円"),
-        ("④⑤",          active45_i,   f"DD {DD_45:,}円"),
-    ]:
+    s6_mark = "⑥" if USE_SYSTEM6 else ""
+    indiv_lbl = f"①③{DD_13:,} / ④⑤{DD_45:,}" + (f" / ⑥{DD_6:,}" if USE_SYSTEM6 else "")
+    slip_groups = [
+        (f"①③④⑤{s6_mark} 合算DD", active,       f"合算DD {DD_LIMIT:,}円"),
+        (f"①③④⑤{s6_mark} 個別DD", active_indiv, indiv_lbl),
+        ("①③",                     active13_i,   f"DD {DD_13:,}円"),
+        ("④⑤",                     active45_i,   f"DD {DD_45:,}円"),
+    ]
+    if USE_SYSTEM6:
+        slip_groups.append(("⑥", active6_i, f"DD {DD_6:,}円"))
+    for grp_lbl, grp, dd_lbl in slip_groups:
         print(f"\n  [{grp_lbl}]  ({dd_lbl})")
         print(f"  {'slip':>5}  {'件数':>6}  {'勝率%':>6}  {'損益(円)':>13}  {'PF':>7}")
         print("  " + "-" * 46)

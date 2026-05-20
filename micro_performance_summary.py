@@ -813,7 +813,7 @@ def main():
         # シグナル一致判定（2セット）
         # =========================
         print_match_result("本日 実運用 vs BT(CSV)",  live_today,     bt_today)
-        print_match_result("本日 実運用 vs BT(XLSX)", live_today,     bt_xlsx_today)
+        print_match_result("☆本日 実運用 vs BT(XLSX)☆", live_today,     bt_xlsx_today)
         print_match_result("昨日 実運用 vs BT(CSV)",  live_yesterday, bt_yesterday)
         print_match_result("昨日 実運用 vs BT(XLSX)", live_yesterday, bt_xlsx_yesterday)
 

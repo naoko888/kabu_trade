@@ -457,7 +457,7 @@ def _exec(arr_high, arr_low, arr_close, arr_hm,
             cl = arr_close[j]
             pnl = float(cl - ep) if side == "long" else float(ep - cl)
             rtype, exit_bar = "SESSION", j; break
-        if arr_weekday is not None and arr_weekday[j] == 0 and arr_hm[j] == 555:
+        if arr_weekday is not None and arr_weekday[j] == 0 and arr_hm[j] == 600:
             cl = arr_close[j]
             pnl = float(cl - ep) if side == "long" else float(ep - cl)
             rtype, exit_bar = "MON_CLOSE", j; break

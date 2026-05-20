@@ -43,12 +43,12 @@ USE_MOVE     = True   # False にすると move_pct条件を無視
 
 # 系統④ ロングパラメータ
 LONG_PARAM = {
-    "move_pct":     0.0003,
+    "move_pct":     0.0001,
     "rsi_th":       40,
     "vol_th":       0.8,
     "lookback":     1,
     "recovery_pct": 0.002,
-    "tp": 300, "sl": 80, "max_hold": 6,
+    "tp": 400, "sl": 80, "max_hold": 8,
 }
 
 # 系統⑤ ショートパラメータ
@@ -62,14 +62,14 @@ SHORT_PARAM = {
 }
 
 # 時間帯デフォルト（bar END hour 基準）
-S4_HOURS_DST = (12, 14, 15, 21, 22, 23)
-S4_HOURS_WIN = (12, 14, 15, 21, 22, 23)
+S4_HOURS_DST = (14, 15, 16, 17, 23)
+S4_HOURS_WIN = (14, 15, 16, 17, 23)
 S5_HOURS_DST = (5, 14, 15, 20, 21, 22, 23)
 S5_HOURS_WIN = (5, 8, 12, 14, 15, 20, 21, 22, 23)
 
 S4_WEEKDAYS  = (0, 1, 2, 3, 4)   # 全曜日
 S5_WEEKDAYS  = (0, 1, 2, 3, 4)
-S4_EXCL_MONTHS: tuple = (1, 7)
+S4_EXCL_MONTHS: tuple = (7,)
 S5_EXCL_MONTHS: tuple = (1, 7)
 
 # 取引日順ソートキー: 17:00以上=その日が取引日、17:00未満=前日が取引日

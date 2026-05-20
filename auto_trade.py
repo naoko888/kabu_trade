@@ -43,6 +43,7 @@ MICRO_SL       = 60           # 旧40  → 系統①②共通
 MICRO_LOT      = 1            # マイクロ先物発注枚数（1570の LOT とは独立）
 MICRO_CSV_FILE = "micro_5min.csv"
 MICRO_DERIV_MONTH   = "202606"
+NEXT_DERIV_MONTH    = "202609"   # ロールオーバー時にここだけ変える
 MICRO_CSV_WARMUP    = Path(r"C:\kabu_trade\micro_5min.csv")  # 過去足ウォームアップ用
 MICRO_WARMUP_BARS   = 300          # ウォームアップ使用本数
 
@@ -50,16 +51,16 @@ MICRO_WARMUP_BARS   = 300          # ウォームアップ使用本数
 TOUCH_PCT = 0.007   # MAタッチ判定 ±0.5%
 
 # ===== 系統④：逆張りロング =====
-SYS4_MOVE_PCT   = 0.0003   # 直前1本比 -0.03%以上の下落
+SYS4_MOVE_PCT   = 0.0001   # 直前1本比 -0.01%以上の下落
 SYS4_RSI_TH     = 40       # RSI14 <= 40
 SYS4_LOOKBACK   = 1
-SYS4_TP         = 300      # 利確幅（pt）
+SYS4_TP         = 400      # 利確幅（pt）
 SYS4_SL         = 80       # 損切幅（pt）
-SYS4_MAX_HOLD   = 6
+SYS4_MAX_HOLD   = 8
 
-S4_HOURS_DST = frozenset((12, 14, 15, 21, 22, 23))
-S4_HOURS_WIN = frozenset((12, 14, 15, 21, 22, 23))
-S4_EXCL_MONTHS = frozenset((1, 7))
+S4_HOURS_DST = frozenset((14, 15, 16, 17, 23))
+S4_HOURS_WIN = frozenset((14, 15, 16, 17, 23))
+S4_EXCL_MONTHS = frozenset((7,))
 
 # ===== 系統⑤：逆張りショート =====
 SYS5_MOVE_PCT   = 0.0006   # 直前4本比 +0.06%以上の上昇
@@ -109,7 +110,7 @@ def is_trading_time(hhmm: int) -> bool:
         return True
     if hhmm >= 1700:          # 夜間セッション前半
         return True
-    if hhmm <= 555:           # 夜間セッション後半（深夜〜朝、5:55足含む）
+    if hhmm <= 600:           # 夜間セッション後半（深夜〜朝、6:00足含む）
         return True
     return False
 
@@ -187,6 +188,9 @@ dry_trade_log = []
 # マイクロ先物
 MICRO_SYMBOL   = None
 MICRO_EXCHANGE = None
+
+_collect_symbols = {}  # {symbol_code: csv_filepath}
+_bar_state       = {}  # {symbol_code: {current, completed, last_vol}}
 
 micro_current_bar    = None
 micro_completed_bars = []
@@ -281,10 +285,36 @@ def get_micro_symbol():
     log("[WARN] マイクロシンボル取得失敗 → マイクロ検証スキップ")
     return False
 
+def _init_collect_symbols():
+    global _collect_symbols, _bar_state
+    months = {MICRO_DERIV_MONTH: MICRO_CSV_FILE}
+    if NEXT_DERIV_MONTH:
+        months[NEXT_DERIV_MONTH] = f"micro_5min_{NEXT_DERIV_MONTH}.csv"
+    for deriv, csv_path in months.items():
+        if deriv == MICRO_DERIV_MONTH and MICRO_SYMBOL:
+            _collect_symbols[MICRO_SYMBOL] = csv_path
+            _bar_state[MICRO_SYMBOL] = {"current": None, "completed": [], "last_vol": None}
+            continue
+        for code in ["NK225micro", "NK225mini"]:
+            url = f"{API_BASE}/symbolname/future?FutureCode={code}&DerivMonth={deriv}"
+            try:
+                res = requests.get(url, headers=headers(), timeout=10)
+                sym = res.json().get("Symbol") if res.status_code == 200 else None
+            except Exception:
+                sym = None
+            if sym:
+                _collect_symbols[sym] = csv_path
+                _bar_state[sym] = {"current": None, "completed": [], "last_vol": None}
+                log(f"[OK] 収集限月登録: {deriv} → {sym} / {csv_path}")
+                break
+
 def register_symbol(retries=5, interval=2.0):
     symbols = [{"Symbol": SYMBOL, "Exchange": EXCHANGE}]
     if MICRO_SYMBOL:
         symbols.append({"Symbol": MICRO_SYMBOL, "Exchange": MICRO_EXCHANGE})
+    for sym in _collect_symbols:
+        if sym != MICRO_SYMBOL:
+            symbols.append({"Symbol": sym, "Exchange": MICRO_EXCHANGE or 2})
 
     for i in range(retries):
         res = requests.put(
@@ -445,7 +475,7 @@ def filter_trading_rows(df: pd.DataFrame) -> pd.DataFrame:
     mask = (
         ((hm >= 845) & (hm < 1540)) |
         (hm >= 1700) |
-        (hm <= 555)
+        (hm <= 600)
     )
     return df[mask]
 
@@ -565,6 +595,24 @@ def save_micro_csv(df):
     combined.to_csv(MICRO_CSV_FILE, encoding="utf-8-sig", index_label="datetime")
     log(f"CSV保存: {MICRO_CSV_FILE}")
 
+def _save_collect_csv(rows, csv_path):
+    df = pd.DataFrame(rows)
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    df = df.drop_duplicates(subset=["datetime"], keep="last").set_index("datetime")
+    df.index = _strip_tz(df.index)
+    if os.path.exists(csv_path):
+        try:
+            existing = pd.read_csv(csv_path, parse_dates=["datetime"]).set_index("datetime")
+            existing.index = _strip_tz(existing.index)
+            df = pd.concat([existing, df])
+            df = df[~df.index.duplicated(keep="last")]
+        except Exception:
+            pass
+    sort_keys = df.index.map(_trading_day_sort_key)
+    df = df.iloc[sort_keys.argsort(kind="stable")]
+    df.to_csv(csv_path, encoding="utf-8-sig", index_label="datetime")
+    log(f"[収集] CSV保存: {csv_path}")
+
 
 # =========================
 # マイクロ ウォームアップ（新規追加）
@@ -671,7 +719,26 @@ def _ws_on_message(ws, message):
     global micro_last_cum_vol
 
     data = json.loads(message)
-    if data.get('Symbol') != MICRO_SYMBOL:
+    sym = data.get('Symbol')
+    if sym != MICRO_SYMBOL:
+        if sym in _bar_state:
+            price_n = data.get('CurrentPrice')
+            price_time_n = data.get('CurrentPriceTime')
+            if price_n is not None and price_time_n is not None:
+                price_n = float(price_n)
+                bar_time_n = floor_5min(
+                    datetime.fromisoformat(price_time_n).astimezone(JST).replace(tzinfo=None)
+                )
+                bar_time_n = _adjust_trading_day(bar_time_n)
+                cum_n = data.get('TradingVolume')
+                with _positions_lock:
+                    vol_n = 0
+                    if cum_n is not None:
+                        cum_n = int(cum_n)
+                        prev = _bar_state[sym]["last_vol"]
+                        vol_n = (cum_n - prev) if (prev is not None and cum_n >= prev) else cum_n
+                        _bar_state[sym]["last_vol"] = cum_n
+                    _update_bar_for_sym(sym, bar_time_n, price_n, vol_n)
         return
 
     price = data.get('CurrentPrice')
@@ -724,6 +791,18 @@ def _update_micro_bar_ws(bar_time, price, volume=0):
     micro_current_bar['low']   = min(micro_current_bar['low'], price)
     micro_current_bar['close'] = price
     micro_current_bar['volume'] += volume
+
+def _update_bar_for_sym(sym, bar_time, price, volume=0):
+    st = _bar_state[sym]
+    if st["current"] is None:
+        st["current"] = start_new_bar(bar_time, price, volume); return
+    if st["current"]["datetime"] != bar_time:
+        st["completed"].append(st["current"])
+        st["current"] = start_new_bar(bar_time, price, volume); return
+    st["current"]["high"]   = max(st["current"]["high"], price)
+    st["current"]["low"]    = min(st["current"]["low"],  price)
+    st["current"]["close"]  = price
+    st["current"]["volume"] += volume
 
 def start_micro_ws():
     import websocket
@@ -955,11 +1034,12 @@ def check_sys4_signal(df):
     """系統④：逆張りロング シグナル判定（BT確定版）
 
     条件：
-    - bar開始時刻のhourがS4_HOURS_DST/WIN（DST判定）に含まれる
-    - 月がS4_EXCL_MONTHS(1,7)に含まれない
-    - SYS4_LOOKBACK本前比でSYS4_MOVE_PCT以上下落
-    - RSI14 <= SYS4_RSI_TH
+    - bar開始時刻のhourがS4_HOURS_DST/WIN (14,15,16,17,23時) に含まれる
+    - 月がS4_EXCL_MONTHS(7月)に含まれない
+    - SYS4_LOOKBACK本前比でSYS4_MOVE_PCT(-0.01%)以上下落
+    - RSI14 <= SYS4_RSI_TH(40)
     ※ vol/recoveryフィルターなし（BT確定設定）
+    ※ 2026-05-21最適化: move_pct 0.0003→0.0001, tp 300→400, max_hold 6→8, 時間帯・除外月見直し
     """
     if df is None or len(df) < SYS4_LOOKBACK + 20:
         return False
@@ -1500,8 +1580,8 @@ def _monitor_micro_dry_inner(now, hhmm, micro_board, verbose):
                 reason = "TP到達"
 
         if reason is None:
-            # 金曜夜間（土曜05:55）：週末持ち越し防止の強制決済
-            if now.weekday() == 5 and hhmm >= 555:
+            # 金曜夜間（土曜06:00）：週末持ち越し防止の強制決済
+            if now.weekday() == 5 and hhmm >= 600:
                 reason = "金曜夜間強制決済"
             # 系統③：土曜強制決済のみ（金曜エントリーの場合）
             elif pos.get("system") == "③" and pos.get("entry_weekday") == 4 and now.weekday() == 5:
@@ -1586,10 +1666,10 @@ def _monitor_micro_dry_inner(now, hhmm, micro_board, verbose):
             last_trade.to_csv(all_file, mode='a', header=not all_file.exists(), index=False, encoding="utf-8-sig")
             log(f"[LOG] マイクロログ保存: {all_file}")
         else:
-            # 系統④: hold_bars インクリメント → MAX_HOLD到達で時間決済
+            # 系統④: 経過バー数で時間決済（1バー=5分）
             if pos.get("system") == "④":
-                pos["hold_bars"] = pos.get("hold_bars", 0) + 1
-                if pos["hold_bars"] >= pos.get("max_hold", SYS4_MAX_HOLD):
+                elapsed_bars = int((now - pos["entry_time"]).total_seconds() / 300)
+                if elapsed_bars >= pos.get("max_hold", SYS4_MAX_HOLD):
                     reason = "TIME決済(MAX_HOLD)"
                     sys_label = "④"
                     prefix    = "[MICRO④]"
@@ -1623,10 +1703,10 @@ def _monitor_micro_dry_inner(now, hhmm, micro_board, verbose):
                     last_trade.to_csv(all_file, mode='a', header=not all_file.exists(), index=False, encoding="utf-8-sig")
                     continue  # still_openに追加しない（クローズ済み）
 
-            # 系統⑤: hold_bars インクリメント → MAX_HOLD到達で時間決済
+            # 系統⑤: 経過バー数で時間決済（1バー=5分）
             if pos.get("system") == "⑤":
-                pos["hold_bars"] = pos.get("hold_bars", 0) + 1
-                if pos["hold_bars"] >= pos.get("max_hold", SYS5_MAX_HOLD):
+                elapsed_bars = int((now - pos["entry_time"]).total_seconds() / 300)
+                if elapsed_bars >= pos.get("max_hold", SYS5_MAX_HOLD):
                     reason    = "TIME決済(MAX_HOLD)"
                     sys_label = "⑤"
                     prefix    = "[MICRO⑤]"
@@ -2030,7 +2110,7 @@ def main():
     print(f"1570: 損切り:-{STOP} 利確:+{TP} LOT:{LOT}  DRY_RUN={DRY_RUN}")
     print(f"マイクロ: SL:{MICRO_SL} TP:{MICRO_TP}  系統①月火水×昼夜間/CPI除外なし  系統③short月水木金  系統④逆張りlong  系統⑤逆張りshort")
     print(f"系統①時間帯: DST:(2,8,15,18,19,21) 冬:(2,8,12,13,15,18,21,23)  系統③時間帯DST: 0/5/8/12/13/14/15/19/20/22/23時  冬: 4/5/15/17/18/19/20/21/22時")
-    print(f"系統④時間帯: DST:12/14/15/21/22/23時  冬:12/14/15/21/22/23時  曜日:全曜日  除外月:1月・7月")
+    print(f"系統④時間帯: DST:14/15/16/17/23時  冬:14/15/16/17/23時  曜日:全曜日  除外月:7月  move:{SYS4_MOVE_PCT}  TP:{SYS4_TP}  SL:{SYS4_SL}  MaxHold:{SYS4_MAX_HOLD}")
     print(f"系統⑤時間帯: DST:5/14/15/20/21/22/23時  冬:5/8/12/14/15/20/21/22/23時  曜日:全曜日  除外月:1月・7月")
     print("=" * 60)
 
@@ -2053,6 +2133,7 @@ def main():
         return
     time.sleep(1.0)
     get_micro_symbol()   # 失敗してもマイクロ検証なしで続行
+    _init_collect_symbols()
     if not register_symbol():
         log("[ERR] 銘柄登録失敗 → 起動中止")
         return
@@ -2162,6 +2243,16 @@ def main():
             mdf = micro_bars_to_df()
             if mdf is not None:
                 save_micro_csv(mdf)
+            for sym, csv_path in _collect_symbols.items():
+                if sym == MICRO_SYMBOL:
+                    continue
+                with _positions_lock:
+                    st = _bar_state.get(sym, {})
+                    rows = st.get("completed", [])[:]
+                    if st.get("current"):
+                        rows.append(st["current"].copy())
+                if rows:
+                    _save_collect_csv(rows, csv_path)
             last_micro_csv_min = now.minute
 
         # =================================================
