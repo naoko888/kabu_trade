@@ -57,7 +57,7 @@ S3_WEEKDAYS    = (0, 2, 3, 4)     # 月・水・木・金
 # 変更後
 S3_EXCL_MONTHS = (5, 7, 11)
 S3_HOURS_DST   = (5, 8, 12, 14, 15, 19, 20, 22, 23, 0)  # DST期間 bar START hour
-S3_HOURS_WIN   = (5, 12, 15, 19, 20, 21, 22, 23)      # 冬時間  bar START hour
+S3_HOURS_WIN   = (4,5, 12, 15, 19, 20, 21, 22, 23)      # 冬時間  bar START hour
 
 # 米国サマータイム期間
 _DST_PERIODS = [
@@ -159,6 +159,15 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["bb_up"]  = df["bb_mid"] + 2 * df["bb_std"]
     df["bb_low"] = df["bb_mid"] - 2 * df["bb_std"]
 
+    # ===== 日次ATR(20日) =====
+    _d = df["datetime"].dt.date
+    _daily = df.groupby(_d).agg(_dh=("high", "max"), _dl=("low", "min")).reset_index()
+    _daily.columns = ["_date", "_dh", "_dl"]
+    _daily["_dr"] = _daily["_dh"] - _daily["_dl"]
+    _daily["atr20"] = _daily["_dr"].rolling(20, min_periods=5).mean()
+    _atr_map = dict(zip(_daily["_date"], _daily["atr20"]))
+    df["atr20"] = _d.map(_atr_map)
+
     return df
 
 
@@ -243,7 +252,8 @@ def run_backtest(df: pd.DataFrame,
                  s3_weekdays_dst=None,
                  s3_weekdays_win=None,
                  skip_holidays=False,
-                 s1_force_session_close: bool = True) -> pd.DataFrame:
+                 s1_force_session_close: bool = True,
+                 atr_threshold: float = None) -> pd.DataFrame:
     """
     s1_excl_months: system ① excluded months
     s3_po: if True, use 3-line PO (ma9<ma20<ma55) for system ③
@@ -258,6 +268,7 @@ def run_backtest(df: pd.DataFrame,
     arr_ma55    = df["ma55"].values
     arr_macd    = df["macd"].values
     arr_msig    = df["macd_sig"].values
+    arr_atr20   = df["atr20"].values
 
     dts         = pd.to_datetime(df["datetime"])
     arr_hour    = dts.dt.hour.values
@@ -307,6 +318,12 @@ def run_backtest(df: pd.DataFrame,
 
         if any(np.isnan(v) for v in [ma9, ma10, ma20, ma55, macd, msig]):
             continue
+
+        # ATRフィルター: 低ボラ日はスキップ
+        if atr_threshold is not None:
+            _atr = arr_atr20[sig_i]
+            if np.isnan(_atr) or _atr < atr_threshold:
+                continue
 
         hr    = (arr_hour[sig_i] * 60 + arr_minute[sig_i] + 5) // 60 % 24  # 系統①用（bar END hour）
         h_raw = arr_hour[sig_i]                                               # 系統③用（bar START hour）
@@ -759,6 +776,18 @@ def main():
 
     # 3. 年×月クロス集計（系統別・合算）
     print_scenario_header("3. 年x月クロス集計 - 損益(円) [月次DD -30,000円適用]")
+    _WD  = {0:"月", 1:"火", 2:"水", 3:"木", 4:"金", 5:"土", 6:"日"}
+    _wd  = lambda wds: "".join(_WD[w] for w in sorted(wds))
+    _hrs = lambda hs:  "/".join(str(h) for h in sorted(hs))
+    print(f"  系統① 曜日:{_wd(_bt_kwargs['s1_weekdays'])}"
+          f"  DST:{_bt_kwargs['s1_hours_dst']}"
+          f"  冬:{_bt_kwargs['s1_hours_win']}"
+          f"  除外月:{_bt_kwargs['s1_excl_months']}")
+    print(f"  系統③ 曜日:{_wd(_bt_kwargs['s3_weekdays_dst'])}"
+          f"  DST:{_hrs(_bt_kwargs['s3_hours_dst'])}時"
+          f"  冬:{_hrs(_bt_kwargs['s3_hours_win'])}時"
+          f"  除外月:{_bt_kwargs['s3_excl_months']}")
+    print()
     trades_dd = sim_monthly_dd(trades, -30_000)["active"]
     months = list(range(1, 13))
     hdr_cross = "  年  系統  " + "".join(f"  {m:>4}月" for m in months) + "    合計"
@@ -788,6 +817,27 @@ def main():
             vals.append(f"{v:>+6,}")
             total += v
         print(f"  計   {label}  " + "  ".join(vals) + f"  {total:>+8,}")
+
+    # 年別PF（DD適用後）
+    print()
+    print(f"  {'':4}  {'年別PF (月次DD -30,000円適用後)':}")
+    pf_hdr = f"  {'年':4}  {'①PF':>7}  {'③PF':>7}  {'合算PF':>7}  {'①件数':>6}  {'③件数':>6}"
+    print(pf_hdr)
+    print("  " + "-" * (len(pf_hdr) - 2))
+    for yr in sorted(trades_dd["signal_year"].unique()):
+        t1y = trades_dd[(trades_dd["signal_year"] == yr) & (trades_dd["system"] == "①")]
+        t3y = trades_dd[(trades_dd["signal_year"] == yr) & (trades_dd["system"] == "③")]
+        tay = trades_dd[trades_dd["signal_year"] == yr]
+        s1y = calc_summary(t1y); s3y = calc_summary(t3y); say = calc_summary(tay)
+        print(f"  {yr}  {pf_str(s1y['pf']):>7}  {pf_str(s3y['pf']):>7}  {pf_str(say['pf']):>7}"
+              f"  {s1y['n']:>6}  {s3y['n']:>6}")
+    # 全期間
+    s1a = calc_summary(trades_dd[trades_dd["system"] == "①"])
+    s3a = calc_summary(trades_dd[trades_dd["system"] == "③"])
+    saa = calc_summary(trades_dd)
+    print("  " + "-" * (len(pf_hdr) - 2))
+    print(f"  {'全期間':4}  {pf_str(s1a['pf']):>7}  {pf_str(s3a['pf']):>7}  {pf_str(saa['pf']):>7}"
+          f"  {s1a['n']:>6}  {s3a['n']:>6}")
 
     # 4. 月次DD制限分析
     print_scenario_header("4. 月次損失上限分析（系統①③合算）")
@@ -1678,6 +1728,88 @@ def main():
     print()
     print_ym_count(trades_nofilter, "全条件なし 年×月 件数")
 
+    # =========================
+    # ボラティリティ×月別分析
+    # =========================
+    print_scenario_header("★ ボラティリティ×月別分析（除外月の負け理由を調査）")
+
+    # 月除外なしで全トレード取得
+    _all_trades = run_backtest(df, cpi,
+        s1_excl_months=(),
+        s3_excl_months=(),
+        s1_weekdays=_bt_kwargs["s1_weekdays"],
+        s1_hours_dst=_bt_kwargs["s1_hours_dst"],
+        s1_hours_win=_bt_kwargs["s1_hours_win"],
+        s3_hours_dst=_bt_kwargs["s3_hours_dst"],
+        s3_hours_win=_bt_kwargs["s3_hours_win"],
+        s3_weekdays_dst=_bt_kwargs["s3_weekdays_dst"],
+        s3_weekdays_win=_bt_kwargs["s3_weekdays_win"],
+    )
+    _atr_map = dict(zip(df["datetime"].dt.date, df["atr20"]))
+    _all_trades["atr20"] = _all_trades["signal_dt"].dt.date.map(_atr_map)
+
+    # ATR閾値: 全期間の中央値で高/低に分ける
+    _atr_med = _all_trades["atr20"].median()
+    print(f"\n  ATR中央値（閾値）: {_atr_med:.0f}pt")
+    print(f"  高ボラ（ATR >= {_atr_med:.0f}pt） / 低ボラ（ATR < {_atr_med:.0f}pt）\n")
+
+    MO_NAMES = {1:"1月",2:"2月",3:"3月",4:"4月",5:"5月",6:"6月",
+                7:"7月",8:"8月",9:"9月",10:"10月",11:"11月",12:"12月"}
+
+    def _pfs(s):
+        if s["n"] == 0: return "    -"
+        return "  inf" if s["pf"] == float("inf") else f"{s['pf']:>7.3f}"
+
+    _DD_LIMIT = -30_000  # マイクロ先物 月次DD上限
+
+    for sys_label in ["①", "③", "合算"]:
+        t = _all_trades if sys_label == "合算" else _all_trades[_all_trades["system"] == sys_label]
+        excl_s1 = set(S1_EXCL_BASE)
+        excl_s3 = set(S3_EXCL_MONTHS)
+
+        print(f"  【系統{sys_label}】")
+        print(f"  {'月':>5}  {'全体PF':>7} {'全N':>5}  {'高ボラPF':>8} {'低ボラPF':>8}  {'最悪月(円)':>12}  {'DD発動':>6}  判定")
+        print("  " + "-" * 82)
+
+        for mo in range(1, 13):
+            grp  = t[t["signal_month"] == mo]
+            if len(grp) == 0:
+                continue
+            hi_v = grp[grp["atr20"] >= _atr_med]
+            lo_v = grp[grp["atr20"] <  _atr_med]
+            s_all = calc_summary(grp)
+            s_hi  = calc_summary(hi_v)
+            s_lo  = calc_summary(lo_v)
+
+            # 年×月ごとの損益合計 → 最悪月・DD発動回数
+            mo_ym_pnl = grp.groupby("signal_year")["pnl_yen"].sum()
+            worst_mo  = int(mo_ym_pnl.min()) if len(mo_ym_pnl) > 0 else 0
+            dd_count  = int((mo_ym_pnl <= _DD_LIMIT).sum())
+            dd_years  = int(mo_ym_pnl.notna().sum())
+
+            excl_mark = ""
+            if sys_label == "①" and mo in excl_s1:    excl_mark = " ←①除外中"
+            elif sys_label == "③" and mo in excl_s3:   excl_mark = " ←③除外中"
+            elif sys_label == "合算" and (mo in excl_s1 or mo in excl_s3): excl_mark = " ←除外中"
+
+            if s_all["n"] == 0:
+                verdict = "-"
+            elif s_all["pf"] >= 1.0:
+                verdict = "勝ち月"
+            elif s_hi["pf"] >= 1.0 and s_lo["pf"] < 1.0:
+                verdict = "★低ボラ主因"
+            elif s_hi["pf"] < 1.0 and s_lo["pf"] < 1.0:
+                verdict = "構造的負け"
+            else:
+                verdict = "その他"
+
+            dd_str = f"{dd_count}/{dd_years}年"
+
+            print(f"  {MO_NAMES[mo]:>5}  {_pfs(s_all):>7} {s_all['n']:>5}  "
+                  f"{_pfs(s_hi):>8} {_pfs(s_lo):>8}  "
+                  f"{worst_mo:>+12,}  {dd_str:>6}  {verdict}{excl_mark}")
+        print()
+
 def _excl_indicator_s1(t1: pd.DataFrame, releases: pd.Series,
                         before_min: int = 30, after_min: int = 60) -> pd.DataFrame:
     """system① トレードから指標ウィンドウ内の signal_dt を除外"""
@@ -1793,6 +1925,7 @@ def print_dd_detail(trades):
         pf_val = pf_by_year.get(year, float("inf"))
         pf_str_val = "  inf" if pf_val == float("inf") else f"{pf_val:>6.3f}"
         print(f"  {year}  {vals}  {int(row['合計']):>+8,}  {pf_str_val}")
+
 
 if __name__ == "__main__":
     import sys

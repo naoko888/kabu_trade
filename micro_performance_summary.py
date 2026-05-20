@@ -38,29 +38,32 @@ S3_EXCL_MONTHS = (7, 11)
 S3_HOURS_DST = (0, 5, 8, 12, 13, 14, 15, 19, 20, 22, 23)
 S3_HOURS_WIN = (4, 5, 15, 17, 18, 19, 20, 21, 22)
 
-# 系統④：逆張りロング
-SYS4_MOVE_PCT      = 0.002
-SYS4_RSI_TH        = 40
-SYS4_VOL_TH        = 0.8
-SYS4_LOOKBACK      = 1
-SYS4_RECOVERY_PCT  = 0.002
-SYS4_EXCLUDE_HOURS = {19}
-SYS4_TP            = 120
-SYS4_SL            = 60
-SYS4_MAX_HOLD      = 6
+# 系統④：逆張りロング（BT確定設定）
+SYS4_MOVE_PCT   = 0.0003
+SYS4_RSI_TH     = 40
+SYS4_LOOKBACK   = 1
+SYS4_TP         = 300
+SYS4_SL         = 80
+SYS4_MAX_HOLD   = 6
 
-# 系統⑤：逆張りショート
-SYS5_MOVE_PCT      = 0.003
-SYS5_RSI_TH        = 70
-SYS5_VOL_TH        = 0.8
-SYS5_LOOKBACK      = 3
-SYS5_RECOVERY_PCT  = 0.002
-SYS5_TP            = 120
-SYS5_SL            = 60
-SYS5_MAX_HOLD      = 6
+S4_HOURS_DST = frozenset((12, 14, 15, 21, 22, 23))
+S4_HOURS_WIN = frozenset((12, 14, 15, 21, 22, 23))
+S4_EXCL_MONTHS = frozenset((1, 7))
 
-# ④⑤合算DD
-SYS45_DD_LIMIT_YEN = -3000
+# 系統⑤：逆張りショート（BT確定設定）
+SYS5_MOVE_PCT   = 0.0006
+SYS5_RSI_TH     = 40
+SYS5_LOOKBACK   = 4
+SYS5_TP         = 300
+SYS5_SL         = 80
+SYS5_MAX_HOLD   = 6
+
+S5_HOURS_DST = frozenset((5, 14, 15, 20, 21, 22, 23))
+S5_HOURS_WIN = frozenset((5, 8, 12, 14, 15, 20, 21, 22, 23))
+S5_EXCL_MONTHS = frozenset((1, 7))
+
+# ①③④⑤合算 月次DD
+ALL_DD_LIMIT = -30_000
 
 SESSION_BOUNDARIES = frozenset({2350})
 
@@ -403,57 +406,53 @@ def build_bt_trades(df: pd.DataFrame, cpi_df: pd.DataFrame):
                 })
 
         # 系統④（逆張りロング）
-        move_pct_4 = (row["close"] - row_p["close"]) / row_p["close"]
-        recovery_4 = (row["close"] - row["low"]) / row["close"] if row["close"] != 0 else 0
-        hr_s4 = dt.hour  # bar START hour
-
+        hr_s4 = dt.hour
+        s4_hours_now = S4_HOURS_DST if is_dst(dt) else S4_HOURS_WIN
         if (
-            hr_s4 not in SYS4_EXCLUDE_HOURS
+            hr_s4 in s4_hours_now
+            and month not in S4_EXCL_MONTHS
             and not pd.isna(row["rsi14"])
-            and not pd.isna(row["vol_ratio"])
-            and move_pct_4 <= -SYS4_MOVE_PCT
-            and row["rsi14"] <= SYS4_RSI_TH
-            and row["vol_ratio"] >= SYS4_VOL_TH
-            and recovery_4 >= SYS4_RECOVERY_PCT
         ):
-            pnl_pt, exit_time, reason = exec_trade_sys(df, ent_i, "long", SYS4_TP, SYS4_SL, SYS4_MAX_HOLD)
-            entry_time = pd.Timestamp(df.iloc[ent_i]["datetime"])
-            trades.append({
-                "system": "④",
-                "side": "long",
-                "entry_time": entry_time,
-                "exit_time": exit_time,
-                "pnl_pt": round(pnl_pt, 4),
-                "pnl_yen": int(round(pnl_pt * PT_TO_YEN, 0)),
-                "reason": reason,
-                "trade_date": entry_time.date(),
-            })
+            move_pct_4 = (row["close"] - row_p["close"]) / row_p["close"]
+            if move_pct_4 <= -SYS4_MOVE_PCT and row["rsi14"] <= SYS4_RSI_TH:
+                pnl_pt, exit_time, reason = exec_trade_sys(df, ent_i, "long", SYS4_TP, SYS4_SL, SYS4_MAX_HOLD)
+                entry_time = pd.Timestamp(df.iloc[ent_i]["datetime"])
+                trades.append({
+                    "system": "④",
+                    "side": "long",
+                    "entry_time": entry_time,
+                    "exit_time": exit_time,
+                    "pnl_pt": round(pnl_pt, 4),
+                    "pnl_yen": int(round(pnl_pt * PT_TO_YEN, 0)),
+                    "reason": reason,
+                    "trade_date": entry_time.date(),
+                })
 
         # 系統⑤（逆張りショート）
-        prev5 = df.iloc[sig_i - SYS5_LOOKBACK]
-        move_pct_5 = (row["close"] - prev5["close"]) / prev5["close"]
-        recovery_5 = (row["high"] - row["close"]) / row["close"] if row["close"] != 0 else 0
-
+        hr_s5 = dt.hour
+        s5_hours_now = S5_HOURS_DST if is_dst(dt) else S5_HOURS_WIN
         if (
-            not pd.isna(row["rsi14"])
-            and not pd.isna(row["vol_ratio"])
-            and move_pct_5 >= SYS5_MOVE_PCT
-            and row["rsi14"] >= SYS5_RSI_TH
-            and row["vol_ratio"] >= SYS5_VOL_TH
-            and recovery_5 >= SYS5_RECOVERY_PCT
+            hr_s5 in s5_hours_now
+            and month not in S5_EXCL_MONTHS
+            and not pd.isna(row["rsi14"])
+            and not is_cpi_window(dt, cpi_df)
+            and sig_i >= SYS5_LOOKBACK
         ):
-            pnl_pt, exit_time, reason = exec_trade_sys(df, ent_i, "short", SYS5_TP, SYS5_SL, SYS5_MAX_HOLD)
-            entry_time = pd.Timestamp(df.iloc[ent_i]["datetime"])
-            trades.append({
-                "system": "⑤",
-                "side": "short",
-                "entry_time": entry_time,
-                "exit_time": exit_time,
-                "pnl_pt": round(pnl_pt, 4),
-                "pnl_yen": int(round(pnl_pt * PT_TO_YEN, 0)),
-                "reason": reason,
-                "trade_date": entry_time.date(),
-            })
+            prev5 = df.iloc[sig_i - SYS5_LOOKBACK]
+            move_pct_5 = (row["close"] - prev5["close"]) / prev5["close"]
+            if move_pct_5 >= SYS5_MOVE_PCT and row["rsi14"] >= SYS5_RSI_TH:
+                pnl_pt, exit_time, reason = exec_trade_sys(df, ent_i, "short", SYS5_TP, SYS5_SL, SYS5_MAX_HOLD)
+                entry_time = pd.Timestamp(df.iloc[ent_i]["datetime"])
+                trades.append({
+                    "system": "⑤",
+                    "side": "short",
+                    "entry_time": entry_time,
+                    "exit_time": exit_time,
+                    "pnl_pt": round(pnl_pt, 4),
+                    "pnl_yen": int(round(pnl_pt * PT_TO_YEN, 0)),
+                    "reason": reason,
+                    "trade_date": entry_time.date(),
+                })
 
     if not trades:
         return pd.DataFrame(columns=["system", "side", "entry_time", "exit_time", "pnl_pt", "pnl_yen", "reason", "trade_date"])
@@ -469,43 +468,28 @@ def apply_monthly_dd(bt: pd.DataFrame):
     sorted_bt = bt.sort_values("entry_time").reset_index(drop=True).copy()
 
     keep = []
-    month_pnl_13 = {}   # 系統①③合算
-    month_pnl_45 = {}   # 系統④⑤合算
-    stopped_13 = set()
-    stopped_45 = set()
+    month_pnl = {}   # ①③④⑤合算
+    stopped = set()
 
     for _, row in sorted_bt.iterrows():
         ym = (row["trade_date"].year, row["trade_date"].month)
         sys = row["system"]
 
-        # 月次初期化
-        if ym not in month_pnl_13:
-            month_pnl_13[ym] = 0.0
-        if ym not in month_pnl_45:
-            month_pnl_45[ym] = 0.0
-
-        # 系統①③
-        if sys in ("①", "③"):
-            if ym in stopped_13:
-                keep.append(False)
-                continue
+        if sys not in ("①", "③", "④", "⑤"):
             keep.append(True)
-            month_pnl_13[ym] += float(row["pnl_yen"])
-            if month_pnl_13[ym] <= MICRO_MONTHLY_DD_LIMIT:
-                stopped_13.add(ym)
+            continue
 
-        # 系統④⑤
-        elif sys in ("④", "⑤"):
-            if ym in stopped_45:
-                keep.append(False)
-                continue
-            keep.append(True)
-            month_pnl_45[ym] += float(row["pnl_yen"])
-            if month_pnl_45[ym] <= SYS45_DD_LIMIT_YEN:
-                stopped_45.add(ym)
+        if ym not in month_pnl:
+            month_pnl[ym] = 0.0
 
-        else:
-            keep.append(True)
+        if ym in stopped:
+            keep.append(False)
+            continue
+
+        keep.append(True)
+        month_pnl[ym] += float(row["pnl_yen"])
+        if month_pnl[ym] <= ALL_DD_LIMIT:
+            stopped.add(ym)
 
     sorted_bt["keep"] = keep
     sorted_bt = sorted_bt[sorted_bt["keep"]].drop(columns=["keep"]).reset_index(drop=True)
