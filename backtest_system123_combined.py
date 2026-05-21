@@ -41,23 +41,22 @@ PT_TO_YEN      = 10
 
 SESSION_BOUNDARIES = frozenset({2350})
 
-# 系統① 条件
+# ※ 以下のデフォルト値は run_bt() 内の _bt_kwargs（下部）で上書きされる
+# ※ 実運用パラメータ（auto_trade.py）と一致するのは _bt_kwargs の値。
+# ※ ここの値はスキャン関数のデフォルト引数としてのみ使用。
+
+# 系統① 条件（デフォルト値 / 実行時は _bt_kwargs で上書き）
 S1_WEEKDAYS = (0,1,2)
-S1_HOURS_DST  = (8, 15, 18, 19, 20, 21)
-S1_HOURS_WIN  = (8, 12, 15, 18, 20, 21, 23)
+S1_HOURS_DST  = (8, 15, 18, 19, 20, 21)   # ← 実行値: (2,8,15,18,19,21)
+S1_HOURS_WIN  = (8, 12, 15, 18, 20, 21, 23)  # ← 実行値: (2,8,12,13,15,18,21,23)
 S1_EXCL_BASE  = (3, 5, 11)
 
-# 系統③ 条件（backtest_perfect_order.py パターン⑤ 準拠）
+# 系統③ 条件（デフォルト値 / 実行時は _bt_kwargs で上書き）
 # 時刻: bar START hour（+5min シフトなし）
-# 曜日: s_strong_weekdays（commission=0 EV>0 n>=100）= 月・水・木・金
-# 除外月: 5月・7月・11月
-# 時間帯: DST/冬時間で分岐（bar START hour 基準）
-# CPI除外: 有効（発表前30分〜後60分）
 S3_WEEKDAYS    = (0, 2, 3, 4)     # 月・水・木・金
-# 変更後
 S3_EXCL_MONTHS = (5, 7, 11)
-S3_HOURS_DST   = (5, 8, 12, 14, 15, 19, 20, 22, 23, 0)  # DST期間 bar START hour
-S3_HOURS_WIN   = (4,5, 12, 15, 19, 20, 21, 22, 23)      # 冬時間  bar START hour
+S3_HOURS_DST   = (5, 8, 12, 14, 15, 19, 20, 22, 23, 0)  # ← 実行値: (0,5,8,12,13,14,15,19,20,22,23)
+S3_HOURS_WIN   = (4, 5, 12, 15, 19, 20, 21, 22, 23)     # ← 実行値: (4,5,15,17,18,19,20,21,22)
 
 # 米国サマータイム期間
 _DST_PERIODS = [

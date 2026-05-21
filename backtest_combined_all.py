@@ -13,8 +13,8 @@ import backtest_system45_combined  as bt45
 
 # ======================================================
 # 系統⑥ トグル
-USE_SYSTEM6 = False  # ⑥スリッページ耐性不足（10pt PF=0.894）のため除外
-DD_6        = -30_000
+USE_SYSTEM6 = True   # 前日終値乖離逆張り（THRESH=250 EV=+16.30pt PF=1.552）
+DD_6        = -15_000
 
 # 【系統④ 見直し履歴】
 # 更新日: 2026-05-21
@@ -53,13 +53,13 @@ BT45_KWARGS = dict(
 )
 
 BT6_KWARGS = dict(
-    adx_th       = 25.0,
-    bb_width_th  = 0.030,
+    thresh       = 250,
     tp           = 200,
     sl           = 80,
     max_hold     = 6,
-    s6_hours_dst = (3, 4, 9, 10, 14, 15, 16, 18, 22, 23),
-    s6_hours_win = (3, 4, 9, 10, 14, 15, 16, 18, 22, 23),
+    cd           = 18,
+    hours        = frozenset({3, 4, 9, 10, 14, 15, 16, 18, 22, 23}),
+    excl_months  = (),
 )
 
 PT_TO_YEN = 10
@@ -153,7 +153,7 @@ def _add_exit_dt(trades: pd.DataFrame, df_price: pd.DataFrame) -> pd.DataFrame:
                     exit_bar = j; break
             if p["session_close"] and arr_hm[j] in bt13.SESSION_BOUNDARIES:
                 exit_bar = j; break
-            if arr_wd[j] == 0 and arr_hm[j] == 555:            # MON_CLOSE (bt13)
+            if arr_wd[j] == 0 and arr_hm[j] == 600:            # MON_CLOSE (bt13)
                 exit_bar = j; break
             if p["weekend_close"] and arr_wd[j] == 0 and arr_hm[j] == 600:  # WEEKEND (bt45)
                 exit_bar = j; break
@@ -217,7 +217,7 @@ def main():
     trades45 = bt45.run_backtest(df45, cpi45, **BT45_KWARGS)
 
     if USE_SYSTEM6:
-        import backtest_system6 as bt6
+        import backtest_system6b as bt6
         print("\n【⑥】データ読み込み中...")
         df6  = bt6.add_indicators(bt6.load_data())
         cpi6 = bt6.load_cpi()

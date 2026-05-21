@@ -830,6 +830,38 @@ def _load_open_positions():
             pos["entry_time"] = datetime.fromisoformat(pos["entry_time"])
     return positions
 
+# 2026-05-21 追加: 再起動時に当月の月次損益を CSV から復元する
+# （修正前は再起動のたびに all_monthly_pnl_yen=0 にリセットされ DD制限が無効化されていた）
+def _restore_monthly_pnl():
+    global all_monthly_pnl_yen, all_monthly_stopped, all_monthly_current_month
+    all_file = LOG_DIR / "micro_dry_log_all.csv"
+    if not all_file.exists():
+        return
+    try:
+        df = pd.read_csv(all_file)
+        if not {"entry_time", "pnl", "system"}.issubset(df.columns):
+            return
+        df["entry_time"] = pd.to_datetime(df["entry_time"], errors="coerce")
+        df["pnl"]        = pd.to_numeric(df["pnl"], errors="coerce")
+        df = df.dropna(subset=["entry_time", "pnl"])
+        now = datetime.now(JST)
+        ym  = (now.year, now.month)
+        target = df[
+            (df["entry_time"].dt.year  == ym[0]) &
+            (df["entry_time"].dt.month == ym[1]) &
+            (df["system"].astype(str).isin(["①", "③", "④", "⑤"]))
+        ]
+        total_yen = float(
+            (target["pnl"] * MICRO_PT_TO_YEN - MICRO_COMMISSION_YEN).round(0).sum()
+        )
+        all_monthly_pnl_yen       = total_yen
+        all_monthly_current_month = ym  # セット済みにして起動時の月次リセットを防ぐ
+        if total_yen <= ALL_DD_LIMIT_YEN:
+            all_monthly_stopped = True
+        log(f"[RESUME] 月次損益復元 (2026-05-21修正): {total_yen:,.0f}円 ({len(target)}件) DD停止={all_monthly_stopped}")
+    except Exception as e:
+        log(f"[WARN] 月次損益復元失敗（DD制限はリセット状態で続行）: {e}")
+
 # =========================
 # CSV品質チェック（起動時：前日データの欠損・出来高0連続確認）
 # =========================
@@ -2120,6 +2152,8 @@ def main():
         log(f"[RESUME] 保有ポジション復元: {len(micro_dry_positions)}件")
         for p in micro_dry_positions:
             log(f"  系統{p.get('system')} {p.get('side')} @ {p.get('entry_price')}")
+
+    _restore_monthly_pnl()   # 2026-05-21: 月次損益をCSVから復元
 
     # ── マイクロウォームアップ（起動時に過去足を読み込む）──
     can_trade = load_micro_warmup()

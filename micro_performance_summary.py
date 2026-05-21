@@ -38,17 +38,17 @@ S3_EXCL_MONTHS = (7, 11)
 S3_HOURS_DST = (0, 5, 8, 12, 13, 14, 15, 19, 20, 22, 23)
 S3_HOURS_WIN = (4, 5, 15, 17, 18, 19, 20, 21, 22)
 
-# 系統④：逆張りロング（BT確定設定）
-SYS4_MOVE_PCT   = 0.0003
+# 系統④：逆張りロング（BT確定設定 2026-05-21最適化）
+SYS4_MOVE_PCT   = 0.0001
 SYS4_RSI_TH     = 40
 SYS4_LOOKBACK   = 1
-SYS4_TP         = 300
+SYS4_TP         = 400
 SYS4_SL         = 80
-SYS4_MAX_HOLD   = 6
+SYS4_MAX_HOLD   = 8
 
-S4_HOURS_DST = frozenset((12, 14, 15, 21, 22, 23))
-S4_HOURS_WIN = frozenset((12, 14, 15, 21, 22, 23))
-S4_EXCL_MONTHS = frozenset((1, 7))
+S4_HOURS_DST = frozenset((14, 15, 16, 17, 23))
+S4_HOURS_WIN = frozenset((14, 15, 16, 17, 23))
+S4_EXCL_MONTHS = frozenset((7,))
 
 # 系統⑤：逆張りショート（BT確定設定）
 SYS5_MOVE_PCT   = 0.0006
@@ -289,8 +289,8 @@ def exec_trade_sys(df: pd.DataFrame, entry_idx: int, side: str, tp: int, sl: int
             pnl = (close_price - ep) if side == "long" else (ep - close_price)
             return pnl - COMMISSION_PT, dt, "SAT_CLOSE"
 
-        # 月曜05:55強制決済
-        if dt.weekday() == 0 and hhmm == 555:
+        # 月曜06:00強制決済
+        if dt.weekday() == 0 and hhmm == 600:
             close_price = float(row["close"])
             pnl = (close_price - ep) if side == "long" else (ep - close_price)
             return pnl - COMMISSION_PT, dt, "MON_CLOSE"
@@ -634,6 +634,131 @@ def print_bar_count_diff(title: str, live_df: pd.DataFrame, bt_df: pd.DataFrame)
             f"  {t}  {r['system']}  {r['side']}  "
             f"実運用={r['count_live']}件  BT={r['count_bt']}件"
         )
+_TP_REASONS      = {"TP", "TP到達"}
+_SL_REASONS      = {"SL", "SL到達"}
+_SESSION_REASONS = {"SESSION", "夜間終了強制決済"}
+_TIME_REASONS    = {"TIME", "SAT_CLOSE", "MON_CLOSE", "TIME決済(MAX_HOLD)", "土曜強制決済", "月曜強制決済"}
+
+
+def _exit_metrics_from(sub: pd.DataFrame) -> dict:
+    pnl = sub["pnl_pt"].astype(float)
+    wins   = sub[pnl > 0]
+    losses = sub[pnl < 0]
+    reason = sub["reason"].astype(str) if "reason" in sub.columns else pd.Series(dtype=str)
+    return {
+        "件数":    len(sub),
+        "TP":     int(reason.isin(_TP_REASONS).sum()),
+        "SL":     int(reason.isin(_SL_REASONS).sum()),
+        "TIME":   int(reason.isin(_TIME_REASONS).sum()),
+        "SESSION":int(reason.isin(_SESSION_REASONS).sum()),
+        "avg勝pt": round(float(wins["pnl_pt"].mean()), 1) if len(wins) > 0 else None,
+        "avg負pt": round(float(losses["pnl_pt"].mean()), 1) if len(losses) > 0 else None,
+        "max勝pt": round(float(pnl.max()), 1) if len(sub) > 0 else None,
+        "min負pt": round(float(pnl.min()), 1) if len(sub) > 0 else None,
+    }
+
+
+def _exit_metrics_single(df: pd.DataFrame, sys: str):
+    if df is None or df.empty:
+        return None
+    sub = df[df["system"].astype(str) == sys]
+    return _exit_metrics_from(sub) if not sub.empty else None
+
+
+def _exit_metrics_all(df: pd.DataFrame):
+    if df is None or df.empty:
+        return None
+    return _exit_metrics_from(df)
+
+
+def _diff_exit_metrics(m_live, m_bt) -> dict | None:
+    if m_live is None and m_bt is None:
+        return None
+    def _n(m, k):
+        return (m[k] or 0) if (m is not None and m.get(k) is not None) else 0
+    def _f(m, k):
+        return m.get(k) if m is not None else None
+    def _df(a, b):
+        if a is None and b is None:
+            return None
+        return round((a or 0.0) - (b or 0.0), 1)
+    return {
+        "件数":    _n(m_live, "件数")    - _n(m_bt, "件数"),
+        "TP":     _n(m_live, "TP")     - _n(m_bt, "TP"),
+        "SL":     _n(m_live, "SL")     - _n(m_bt, "SL"),
+        "TIME":   _n(m_live, "TIME")   - _n(m_bt, "TIME"),
+        "SESSION":_n(m_live, "SESSION")- _n(m_bt, "SESSION"),
+        "avg勝pt": _df(_f(m_live, "avg勝pt"), _f(m_bt, "avg勝pt")),
+        "avg負pt": _df(_f(m_live, "avg負pt"), _f(m_bt, "avg負pt")),
+    }
+
+
+def print_exit_breakdown(title: str, live_df: pd.DataFrame, bt_df: pd.DataFrame):
+    print(f"\n===== {title} exit内訳（系統別）=====")
+
+    SYSTEMS = ("①", "③", "④", "⑤")
+    SEP = "  " + "─" * 96
+
+    HDR = (
+        f"  {'系統':>4}  {'区分':>8}"
+        f"  {'件数':>5}  {'TP':>5}  {'SL':>5}  {'TIME':>5}  {'SESSION':>7}"
+        f"  {'avg勝pt':>8}  {'avg負pt':>8}  {'max勝pt':>8}  {'min負pt':>8}"
+    )
+    print(HDR)
+    print(SEP)
+
+    def _fp(v):
+        return f"{v:>+8.1f}" if v is not None else "     ---"
+
+    def _fn(v, signed=False):
+        if v is None:
+            return "    -"
+        return f"{v:>+5d}" if signed else f"{v:>5d}"
+
+    def print_row(sys_label, label, m, is_diff=False):
+        if m is None:
+            dash5 = "    -"
+            dash7 = "      -"
+            print(
+                f"  {sys_label:>4}  {label:>8}"
+                f"  {dash5}  {dash5}  {dash5}  {dash5}  {dash7}"
+                f"  {'     ---'}  {'     ---'}  {'     ---'}  {'     ---'}"
+            )
+            return
+        if is_diff:
+            row_avg_w = _fp(m.get("avg勝pt"))
+            row_avg_l = _fp(m.get("avg負pt"))
+            row_max_w = "        "
+            row_min_l = "        "
+        else:
+            row_avg_w = _fp(m["avg勝pt"])
+            row_avg_l = _fp(m["avg負pt"])
+            row_max_w = _fp(m["max勝pt"])
+            row_min_l = _fp(m["min負pt"])
+        print(
+            f"  {sys_label:>4}  {label:>8}"
+            f"  {_fn(m['件数'], is_diff)}  {_fn(m['TP'], is_diff)}"
+            f"  {_fn(m['SL'], is_diff)}  {_fn(m['TIME'], is_diff)}  {_fn(m['SESSION'], is_diff):>7}"
+            f"  {row_avg_w}  {row_avg_l}  {row_max_w}  {row_min_l}"
+        )
+
+    for sys in SYSTEMS:
+        m_live = _exit_metrics_single(live_df, sys)
+        m_bt   = _exit_metrics_single(bt_df,   sys)
+        d      = _diff_exit_metrics(m_live, m_bt)
+        print_row(sys, "実運用",  m_live)
+        print_row(sys, "BT",     m_bt)
+        print_row(sys, "差分",   d, is_diff=True)
+        print(SEP)
+
+    m_live_all = _exit_metrics_all(live_df)
+    m_bt_all   = _exit_metrics_all(bt_df)
+    d_all      = _diff_exit_metrics(m_live_all, m_bt_all)
+    print_row("合計", "実運用", m_live_all)
+    print_row("合計", "BT",    m_bt_all)
+    print_row("合計", "差分",  d_all, is_diff=True)
+
+
 def print_match_result(title: str, live_df: pd.DataFrame, bt_df: pd.DataFrame):
     print(f"\n===== {title}のシグナル一致判定 =====")
 
@@ -824,6 +949,14 @@ def main():
         print_bar_count_diff("本日 実運用 vs BT(XLSX)", live_today,     bt_xlsx_today)
         print_bar_count_diff("昨日 実運用 vs BT(CSV)",  live_yesterday, bt_yesterday)
         print_bar_count_diff("昨日 実運用 vs BT(XLSX)", live_yesterday, bt_xlsx_yesterday)
+
+        # =========================
+        # exit内訳（系統別）
+        # =========================
+        print_exit_breakdown("本日 実運用 vs BT(CSV)",  live_today,     bt_today)
+        print_exit_breakdown("本日 実運用 vs BT(XLSX)", live_today,     bt_xlsx_today)
+        print_exit_breakdown("昨日 実運用 vs BT(CSV)",  live_yesterday, bt_yesterday)
+        print_exit_breakdown("昨日 実運用 vs BT(XLSX)", live_yesterday, bt_xlsx_yesterday)
 
     # =========================
     # 期間比較（Now基準）
