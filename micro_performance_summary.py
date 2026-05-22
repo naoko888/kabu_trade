@@ -29,14 +29,14 @@ MICRO_MONTHLY_DD_LIMIT = -30_0000  # 円
 
 # ★ 実運用コードと揃える
 S1_WEEKDAYS = (0, 1, 2)  # 月火水
-S1_HOURS_DST = (2, 8, 15, 18, 19, 21)
-S1_HOURS_WIN = (2, 8, 12, 13, 15, 18, 21, 23)
-S1_EXCL_MONTHS = (3, 11)
+S1_HOURS_DST = (2, 8, 18, 19, 21)
+S1_HOURS_WIN = (2, 8, 12, 18, 21, 23)
+S1_EXCL_MONTHS = (3, 5, 11)
 
 S3_WEEKDAYS = (0, 2, 3, 4)  # 月水木金
-S3_EXCL_MONTHS = (7, 11)
-S3_HOURS_DST = (0, 5, 8, 12, 13, 14, 15, 19, 20, 22, 23)
-S3_HOURS_WIN = (4, 5, 15, 17, 18, 19, 20, 21, 22)
+S3_EXCL_MONTHS = (5, 7, 11)
+S3_HOURS_DST = (0, 5, 8, 19, 20, 23)
+S3_HOURS_WIN = (4, 5, 17, 18, 19, 20, 21)
 
 # 系統④：逆張りロング（BT確定設定 2026-05-21最適化）
 SYS4_MOVE_PCT   = 0.0001
@@ -58,14 +58,15 @@ SYS5_TP         = 300
 SYS5_SL         = 80
 SYS5_MAX_HOLD   = 6
 
-S5_HOURS_DST = frozenset((5, 14, 15, 20, 21, 22, 23))
-S5_HOURS_WIN = frozenset((5, 8, 12, 14, 15, 20, 21, 22, 23))
+S5_HOURS_DST = frozenset((14, 15, 22))
+S5_HOURS_WIN = frozenset((8, 12, 14, 15, 22))
 S5_EXCL_MONTHS = frozenset((1, 7))
 
 # ①③④⑤合算 月次DD
 ALL_DD_LIMIT = -30_000
 
 SESSION_BOUNDARIES = frozenset({2350})
+GAP_BOUNDARIES     = frozenset({1540, 555})  # 15:40=昼終値, 5:55=夜間終値
 
 
 def _trading_day_sort_key(dt):
@@ -277,6 +278,12 @@ def exec_trade_sys(df: pd.DataFrame, entry_idx: int, side: str, tp: int, sl: int
             if bhi >= ep + sl:
                 return -sl - COMMISSION_PT, dt, "SL"
 
+        # 15:40 / 5:55 ギャップ前強制決済（BT close_before_gap=True 相当）
+        if hhmm in GAP_BOUNDARIES:
+            close_price = float(row["close"])
+            pnl = (close_price - ep) if side == "long" else (ep - close_price)
+            return pnl - COMMISSION_PT, dt, "GAP_CLOSE"
+
         # 23:50強制決済（force_session_close=Trueの場合のみ）
         if force_session_close and hhmm in SESSION_BOUNDARIES:
             close_price = float(row["close"])
@@ -310,7 +317,8 @@ def build_bt_trades(df: pd.DataFrame, cpi_df: pd.DataFrame):
         ent_i = i       # エントリー足
 
         ent_dt = pd.Timestamp(df.iloc[ent_i]["datetime"])
-        if ent_dt.hour == 17 and ent_dt.minute == 0:
+        ent_hhmm = ent_dt.hour * 100 + ent_dt.minute
+        if ent_hhmm in {1700, 845}:
             continue
 
         row = df.iloc[sig_i]
@@ -406,7 +414,7 @@ def build_bt_trades(df: pd.DataFrame, cpi_df: pd.DataFrame):
                 })
 
         # 系統④（逆張りロング）
-        hr_s4 = dt.hour
+        hr_s4 = (dt.hour * 60 + dt.minute - 5) // 60 % 24  # BT45と同式（-5分シフト）
         s4_hours_now = S4_HOURS_DST if is_dst(dt) else S4_HOURS_WIN
         if (
             hr_s4 in s4_hours_now
@@ -415,7 +423,7 @@ def build_bt_trades(df: pd.DataFrame, cpi_df: pd.DataFrame):
         ):
             move_pct_4 = (row["close"] - row_p["close"]) / row_p["close"]
             if move_pct_4 <= -SYS4_MOVE_PCT and row["rsi14"] <= SYS4_RSI_TH:
-                pnl_pt, exit_time, reason = exec_trade_sys(df, ent_i, "long", SYS4_TP, SYS4_SL, SYS4_MAX_HOLD)
+                pnl_pt, exit_time, reason = exec_trade_sys(df, ent_i, "long", SYS4_TP, SYS4_SL, SYS4_MAX_HOLD, force_session_close=False)
                 entry_time = pd.Timestamp(df.iloc[ent_i]["datetime"])
                 trades.append({
                     "system": "④",
@@ -429,7 +437,7 @@ def build_bt_trades(df: pd.DataFrame, cpi_df: pd.DataFrame):
                 })
 
         # 系統⑤（逆張りショート）
-        hr_s5 = dt.hour
+        hr_s5 = (dt.hour * 60 + dt.minute - 5) // 60 % 24  # BT45と同式（-5分シフト）
         s5_hours_now = S5_HOURS_DST if is_dst(dt) else S5_HOURS_WIN
         if (
             hr_s5 in s5_hours_now
@@ -441,7 +449,7 @@ def build_bt_trades(df: pd.DataFrame, cpi_df: pd.DataFrame):
             prev5 = df.iloc[sig_i - SYS5_LOOKBACK]
             move_pct_5 = (row["close"] - prev5["close"]) / prev5["close"]
             if move_pct_5 >= SYS5_MOVE_PCT and row["rsi14"] >= SYS5_RSI_TH:
-                pnl_pt, exit_time, reason = exec_trade_sys(df, ent_i, "short", SYS5_TP, SYS5_SL, SYS5_MAX_HOLD)
+                pnl_pt, exit_time, reason = exec_trade_sys(df, ent_i, "short", SYS5_TP, SYS5_SL, SYS5_MAX_HOLD, force_session_close=False)
                 entry_time = pd.Timestamp(df.iloc[ent_i]["datetime"])
                 trades.append({
                     "system": "⑤",

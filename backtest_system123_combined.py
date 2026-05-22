@@ -303,7 +303,7 @@ def run_backtest(df: pd.DataFrame,
         sig_i = i - 1
         ent_i = i
 
-        if arr_hour[ent_i] == 17 and arr_minute[ent_i] == 0:
+        if arr_hm[ent_i] in {1700, 845}:
             continue
 
         if position_bars > 0:
@@ -362,9 +362,10 @@ def run_backtest(df: pd.DataFrame,
 
                 if above and touch and gc and ma_dist_ok and entry_ok:
                     ep = arr_open[ent_i]
-                    pnl, rtype = _exec(arr_high, arr_low, arr_close, arr_hm,
+                    pnl, rtype = _exec(arr_high, arr_low, arr_close, arr_open, arr_hm,
                                        ep, ent_i, "long", n,
                                        force_session_close=s1_force_session_close,
+                                       close_before_gap=True,
                                        arr_weekday=arr_weekday)
                     pnl -= COMMISSION_PT
                     trades.append({
@@ -401,9 +402,11 @@ def run_backtest(df: pd.DataFrame,
 
                 if below and touch_hi and dc and ma_dist_ok and entry_ok:
                     ep = arr_open[ent_i]
-                    pnl, rtype = _exec(arr_high, arr_low, arr_close, arr_hm,
+                    pnl, rtype = _exec(arr_high, arr_low, arr_close, arr_open, arr_hm,
                                        ep, ent_i, "short", n,
                                        force_session_close=False,  # パターン⑤準拠: セッション境界強制決済なし
+                                       s3_close_at_17h=False,      # close_before_gapで代替
+                                       close_before_gap=True,      # 15:40/5:55強制決済
                                        max_hold=50,                # パターン⑤準拠: 最大保有50本
                                        arr_weekday=arr_weekday)
                     pnl -= COMMISSION_PT
@@ -426,32 +429,66 @@ def run_backtest(df: pd.DataFrame,
     return pd.DataFrame(trades).reset_index(drop=True)
 
 
-def _exec(arr_high, arr_low, arr_close, arr_hm,
+def _exec(arr_high, arr_low, arr_close, arr_open, arr_hm,
           ep: float, ei: int, side: str, n: int,
           force_session_close: bool = True,
+          s3_close_at_17h: bool = False,
+          close_before_gap: bool = False,
           max_hold: int = MAX_HOLD,
           arr_weekday=None):
     """Trade execution kernel (inlined for performance)
     force_session_close=False: no 23:50 forced exit (matches backtest_perfect_order.py behavior)
+    s3_close_at_17h: close at 17:00 bar open price (captures session gap)
+    close_before_gap: 15:40と5:55バーのclose価格で強制決済（ギャップをまたがない）
+      - 15:40 → 17:00 ギャップ（昼→夜間セッション）
+      - 5:55  → 8:45  ギャップ（夜間終了→翌朝日中開始）
     max_hold: max bars to hold (default MAX_HOLD=120; use 50 for system ③ パターン⑤準拠)
+    TP/SL gap handling: if bar open already beyond TP/SL, exit at open price
+      - TP gap → open が TP方向に超えている → open価格で決済（より有利）
+      - SL gap → open が SL方向に超えている → open価格で決済（より不利）
     """
+    GAP_BOUNDARIES = frozenset({1540, 555})  # 15:40=昼終値, 5:55=夜間終値
+
     pnl   = None
     rtype = None
     exit_bar = ei
 
     for j in range(ei, min(ei + max_hold, n)):
+        # ギャップ前強制決済（①③④⑤用）
+        if close_before_gap and arr_hm[j] in GAP_BOUNDARIES:
+            cl = arr_close[j]
+            pnl = float(cl - ep) if side == "long" else float(ep - cl)
+            rtype, exit_bar = f"GAP_CLOSE_{arr_hm[j]}", j; break
+
+        # 系統③用: 17:00バーのopen価格で強制決済（セッションギャップを反映）
+        if s3_close_at_17h and arr_hm[j] == 1700:
+            op = arr_open[j]
+            pnl = float(op - ep) if side == "long" else float(ep - op)
+            rtype, exit_bar = "SESSION_17H", j; break
+
         bhi = arr_high[j]
         blo = arr_low[j]
+        bop = arr_open[j]
+
         if side == "long":
             if bhi >= ep + TP:
-                pnl, rtype, exit_bar = float(TP),  "TP",  j; break
+                # openがTP方向に超えていたらopen価格で決済（より有利）
+                exit_p = bop if bop >= ep + TP else ep + TP
+                pnl, rtype, exit_bar = float(exit_p - ep), "TP", j; break
             if blo <= ep - SL:
-                pnl, rtype, exit_bar = float(-SL), "SL",  j; break
+                # openがSL方向に超えていたらopen価格で決済（より不利）
+                exit_p = bop if bop <= ep - SL else ep - SL
+                pnl, rtype, exit_bar = float(exit_p - ep), "SL", j; break
         else:
             if blo <= ep - TP:
-                pnl, rtype, exit_bar = float(TP),  "TP",  j; break
+                # openがTP方向に超えていたらopen価格で決済（より有利）
+                exit_p = bop if bop <= ep - TP else ep - TP
+                pnl, rtype, exit_bar = float(ep - exit_p), "TP", j; break
             if bhi >= ep + SL:
-                pnl, rtype, exit_bar = float(-SL), "SL",  j; break
+                # openがSL方向に超えていたらopen価格で決済（より不利）
+                exit_p = bop if bop >= ep + SL else ep + SL
+                pnl, rtype, exit_bar = float(ep - exit_p), "SL", j; break
+
         if force_session_close and arr_hm[j] in SESSION_BOUNDARIES:
             cl = arr_close[j]
             pnl = float(cl - ep) if side == "long" else float(ep - cl)

@@ -34,10 +34,10 @@ BT13_KWARGS = dict(
     s1_excl_months  = bt13.S1_EXCL_BASE,        # (3, 5, 11)
     s3_excl_months  = bt13.S3_EXCL_MONTHS,       # (5, 7, 11)
     s1_weekdays     = (0, 1, 2),
-    s1_hours_dst    = (2, 8, 15, 18, 19, 21),
-    s1_hours_win    = (2, 8, 12, 13, 15, 18, 21, 23),
-    s3_hours_dst    = (0, 5, 8, 12, 13, 14, 15, 19, 20, 22, 23),
-    s3_hours_win    = (4, 5, 15, 17, 18, 19, 20, 21, 22),
+    s1_hours_dst    = (2, 8, 18, 19, 21),                    # 除外: 15（15:40強制決済で毎回負け）
+    s1_hours_win    = (2, 8, 12, 18, 21, 23),               # 除外: 13,15（12h復元検証）
+    s3_hours_dst    = (0, 5, 8, 19, 20, 23),                  # 除外: 12,13,14,15,22（全確認済）
+    s3_hours_win    = (4, 5, 17, 18, 19, 20, 21),            # 除外: 15,22
     s3_weekdays_dst = (0, 2, 3, 4),
     s3_weekdays_win = (0, 2, 3, 4),
 )
@@ -384,7 +384,7 @@ def main():
 
     # ============================================================
     print(f"\n{SEP80}")
-    print("  5. 月次損失上限分析（系統①③④⑤ 合算）")
+    print(f"  5. 月次損失上限分析（系統①③④⑤{s6_tag} 合算）")
     print(SEP80)
     limits = [None, -20_000, -30_000, -40_000, -50_000, -60_000]
     print(f"\n  {'制限(円)':>12}  {'件数':>6}  {'スキップ':>8}  {'発動月':>6}  {'勝率%':>6}  {'損益(円)':>13}  {'PF':>7}")
@@ -467,6 +467,40 @@ def main():
             t["pnl_yen"] = (t["pnl_pt"] * PT_TO_YEN).round().astype(int)
             s = calc_summary(t)
             print(f"  {sl:>3}pt  {s['n']:>6}  {s['win_rate']:>5.1f}%  {s['pnl_yen']:>+13,}  {pf_s(s['pf']):>7}")
+
+    # ============================================================
+    print(f"\n{SEP80}")
+    print("  7. 時間帯別EV分析（①③④⑤ 各系統・DD制限なし）")
+    print("     ※ signal_hour = エントリー時の時刻（0〜23）")
+    print("     ★ = EV負（除外候補）  ▲ = PF<1.1（弱い候補）")
+    print(SEP80)
+
+    def hour_ev_table(df, label):
+        df = df.copy()
+        df["hour"] = df["signal_dt"].dt.hour
+        print(f"\n  【{label}】")
+        print(f"  {'時':>3}  {'件数':>5}  {'勝率%':>6}  {'EV(pt)':>8}  {'PF':>7}  {'損益(円)':>12}")
+        print("  " + "-" * 55)
+        total_pnl = 0
+        for hr in range(24):
+            sub = df[df["hour"] == hr]
+            if len(sub) == 0:
+                continue
+            pnl  = sub["pnl_pt"].values
+            wins = pnl[pnl > 0].sum()
+            loss = abs(pnl[pnl < 0].sum())
+            n    = len(sub)
+            ev   = pnl.sum() / n
+            wr   = (pnl > 0).mean() * 100
+            pf_v = wins / loss if loss > 0 else float("inf")
+            pnl_yen = int(sub["pnl_yen"].sum())
+            total_pnl += pnl_yen
+            flag = "★" if ev < 0 else ("▲" if pf_v < 1.1 else "  ")
+            print(f"  {hr:02d}h {flag}  {n:>5}  {wr:>5.1f}%  {ev:>+8.2f}  {pf_s(pf_v):>7}  {pnl_yen:>+12,}")
+        print(f"  {'合計':>4}  {'':>5}  {'':>6}  {'':>8}  {'':>7}  {total_pnl:>+12,}")
+
+    for sys_lbl, sys_df in [("系統①", t1), ("系統③", t3), ("系統④", t4), ("系統⑤", t5)]:
+        hour_ev_table(sys_df, sys_lbl)
 
 
 if __name__ == "__main__":

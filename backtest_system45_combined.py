@@ -64,8 +64,8 @@ SHORT_PARAM = {
 # 時間帯デフォルト（bar END hour 基準）
 S4_HOURS_DST = (14, 15, 16, 17, 23)
 S4_HOURS_WIN = (14, 15, 16, 17, 23)
-S5_HOURS_DST = (5, 14, 15, 20, 21, 22, 23)
-S5_HOURS_WIN = (5, 8, 12, 14, 15, 20, 21, 22, 23)
+S5_HOURS_DST = (14, 15, 22)                    # 除外: 5,20,21,23（全確認済）
+S5_HOURS_WIN = (8, 12, 14, 15, 22)            # 除外: 5,20,21,23（全確認済）
 
 S4_WEEKDAYS  = (0, 1, 2, 3, 4)   # 全曜日
 S5_WEEKDAYS  = (0, 1, 2, 3, 4)
@@ -273,11 +273,14 @@ def run_backtest(
                     conds.append(recovery >= lp["recovery_pct"])
 
                 if all(conds):
+                    if arr_hm[i + 1] in {1700, 845}:
+                        continue
                     ep = float(arr_open[i + 1])
-                    pnl, exit_i, rtype = _exec(arr_high, arr_low, arr_close,
+                    pnl, exit_i, rtype = _exec(arr_high, arr_low, arr_close, arr_open,
                                                ep, i + 1, "long",
                                                lp["tp"], lp["sl"], lp["max_hold"], n,
-                                               arr_hm=arr_hm, arr_pwd=arr_pwd)
+                                               arr_hm=arr_hm, arr_pwd=arr_pwd,
+                                               close_before_gap=True)
                     pnl -= COMMISSION_PT
                     rows.append({
                         "system": "④",
@@ -309,11 +312,14 @@ def run_backtest(
                     conds.append(fade >= sp["recovery_pct"])
 
                 if all(conds):
+                    if arr_hm[i + 1] in {1700, 845}:
+                        continue
                     ep = float(arr_open[i + 1])
-                    pnl, exit_i, rtype = _exec(arr_high, arr_low, arr_close,
+                    pnl, exit_i, rtype = _exec(arr_high, arr_low, arr_close, arr_open,
                                                ep, i + 1, "short",
                                                sp["tp"], sp["sl"], sp["max_hold"], n,
-                                               arr_hm=arr_hm, arr_pwd=arr_pwd)
+                                               arr_hm=arr_hm, arr_pwd=arr_pwd,
+                                               close_before_gap=True)
                     pnl -= COMMISSION_PT
                     rows.append({
                         "system": "⑤",
@@ -330,16 +336,35 @@ def run_backtest(
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 
-def _exec(arr_high, arr_low, arr_close, ep, entry_i, side, tp, sl, max_hold, n,
-          arr_hm=None, arr_pwd=None):
+def _exec(arr_high, arr_low, arr_close, arr_open, ep, entry_i, side, tp, sl, max_hold, n,
+          arr_hm=None, arr_pwd=None, close_before_gap=False):
+    GAP_BOUNDARIES = frozenset({1540, 555})  # 15:40=昼終値, 5:55=夜間終値
     for j in range(entry_i, min(entry_i + max_hold, n)):
-        hi = arr_high[j]; lo = arr_low[j]
+        # ギャップ前強制決済（①③④⑤用）
+        if close_before_gap and arr_hm is not None and arr_hm[j] in GAP_BOUNDARIES:
+            cl = arr_close[j]
+            pnl = float(cl - ep) if side == "long" else float(ep - cl)
+            return pnl, j, f"GAP_CLOSE_{arr_hm[j]}"
+
+        hi = arr_high[j]; lo = arr_low[j]; op = arr_open[j]
         if side == "long":
-            if hi >= ep + tp: return tp,  j, "TP"
-            if lo <= ep - sl: return -sl, j, "SL"
+            if hi >= ep + tp:
+                # openがTP方向に超えていたらopen価格で決済（より有利）
+                exit_p = op if op >= ep + tp else ep + tp
+                return float(exit_p - ep), j, "TP"
+            if lo <= ep - sl:
+                # openがSL方向に超えていたらopen価格で決済（より不利）
+                exit_p = op if op <= ep - sl else ep - sl
+                return float(exit_p - ep), j, "SL"
         else:
-            if lo <= ep - tp: return tp,  j, "TP"
-            if hi >= ep + sl: return -sl, j, "SL"
+            if lo <= ep - tp:
+                # openがTP方向に超えていたらopen価格で決済（より有利）
+                exit_p = op if op <= ep - tp else ep - tp
+                return float(ep - exit_p), j, "TP"
+            if hi >= ep + sl:
+                # openがSL方向に超えていたらopen価格で決済（より不利）
+                exit_p = op if op >= ep + sl else ep + sl
+                return float(ep - exit_p), j, "SL"
         # 週末強制決済: 物理月曜06:00（日曜夜間終了→08:45日中開始前のギャップ直前）
         if arr_hm is not None and arr_pwd is not None:
             if arr_pwd[j] == 0 and arr_hm[j] == 600:
@@ -559,10 +584,69 @@ def main():
         print(f"  {sl:>3}pt  {s['n']:>5}  {s['win_rate']:>5.1f}%  {s['pnl_yen']:>+12,}  {pf_s(s['pf']):>7}")
 
 
+def _slip_pf(pf, total_ev_pt, win_rate_pct, n, slip_pt):
+    """スリッページ適用後のPF計算"""
+    if n == 0 or pf <= 1:
+        return 0.0
+    p = win_rate_pct / 100
+    total_pnl = total_ev_pt * n
+    gl = total_pnl / (pf - 1)
+    gw = pf * gl
+    gw2 = gw - p * n * slip_pt
+    gl2 = gl + (1 - p) * n * slip_pt
+    return gw2 / gl2 if gl2 > 0 else float("inf")
+
+
+def grid_search_s4(df, cpi):
+    """系統④ TP/SL グリッドサーチ"""
+    from itertools import product as iprod
+    TP_LIST = [80, 100, 120, 150, 200, 250, 300, 400]
+    SL_LIST = [50, 60, 80, 100, 120, 150]
+    orig_tp, orig_sl = LONG_PARAM["tp"], LONG_PARAM["sl"]
+
+    rows = []
+    total = len(TP_LIST) * len(SL_LIST)
+    done = 0
+    for tp, sl in iprod(TP_LIST, SL_LIST):
+        LONG_PARAM["tp"] = tp
+        LONG_PARAM["sl"] = sl
+        t = run_backtest(df, cpi, use_recovery=USE_RECOVERY, use_vol=USE_VOL,
+                         use_rsi=USE_RSI, use_move=USE_MOVE)
+        t4 = t[t["system"] == "④"] if not t.empty else t
+        s = calc_summary(t4)
+        n, wr, ev, pf0, pnl = s["n"], s["win_rate"], s["ev"], s["pf"], s["pnl_yen"]
+        pf4 = _slip_pf(pf0, ev, wr, n, 4)
+        pf8 = _slip_pf(pf0, ev, wr, n, 8)
+        rows.append((tp, sl, n, wr, ev, pf0, pf4, pf8, pnl))
+        done += 1
+        print(f"\r  検証中... {done}/{total}", end="", flush=True)
+
+    LONG_PARAM["tp"] = orig_tp
+    LONG_PARAM["sl"] = orig_sl
+
+    rows.sort(key=lambda x: x[5], reverse=True)
+    print(f"\r", end="")
+    print("\n" + "=" * 90)
+    print("  系統④ TP/SL グリッドサーチ結果（PF降順）")
+    print("=" * 90)
+    print(f"  {'TP':>4}  {'SL':>4}  {'件数':>6}  {'勝率%':>6}  {'EV(pt)':>7}  "
+          f"{'PF(0)':>7}  {'PF(4pt)':>7}  {'PF(8pt)':>7}  {'損益(万円)':>9}")
+    print("  " + "-" * 85)
+    for tp, sl, n, wr, ev, pf0, pf4, pf8, pnl in rows:
+        flag = " ★" if pf0 >= 1.30 else (" ▲" if pf0 >= 1.20 else "")
+        print(f"  {tp:>4}  {sl:>4}  {n:>6}  {wr:>5.1f}%  {ev:>+7.2f}  "
+              f"{pf0:>7.3f}  {pf4:>7.3f}  {pf8:>7.3f}  {pnl/10000:>+9.1f}万{flag}")
+
+
 if __name__ == "__main__":
-    with open("bt_result45.txt", "w", encoding="utf-8") as f:
-        sys.stdout = f
-        main()
-    sys.stdout = sys.__stdout__
-    import subprocess
-    subprocess.Popen(["code", "bt_result45.txt"])
+    if "--grid" in sys.argv:
+        _df = add_indicators(load_data())
+        _cpi = load_cpi()
+        grid_search_s4(_df, _cpi)
+    else:
+        with open("bt_result45.txt", "w", encoding="utf-8") as f:
+            sys.stdout = f
+            main()
+        sys.stdout = sys.__stdout__
+        import subprocess
+        subprocess.Popen(["code", "bt_result45.txt"])
