@@ -121,20 +121,6 @@ def load_data() -> pd.DataFrame:
         d = read_excel(p)
         print(f"  {fname}: {len(d)} 本")
         dfs.append(d)
-    if MICRO_CSV.exists():
-        try:
-            dc = pd.read_csv(MICRO_CSV, index_col="datetime", parse_dates=True).reset_index()
-            if dc["datetime"].dt.tz is not None:
-                dc["datetime"] = dc["datetime"].dt.tz_convert("Asia/Tokyo").dt.tz_localize(None)
-            for c in ["open", "high", "low", "close", "volume"]:
-                if c in dc.columns:
-                    dc[c] = pd.to_numeric(dc[c], errors="coerce")
-            dc = dc.dropna(subset=["datetime","open","high","low","close"])[
-                ["datetime","open","high","low","close","volume"]].sort_values("datetime")
-            print(f"  micro_5min.csv: {len(dc)} 本")
-            dfs.append(dc)
-        except Exception as e:
-            print(f"  micro_5min.csv 読み込み失敗: {e}")
     if not dfs:
         raise FileNotFoundError("データファイルが見つかりません")
     df = pd.concat(dfs, ignore_index=True).drop_duplicates(subset=["datetime"]).copy()

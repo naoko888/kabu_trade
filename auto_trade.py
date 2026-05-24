@@ -86,6 +86,7 @@ S6_HOURS      = frozenset({3, 4, 9, 10, 14, 15, 16, 18, 22, 23})
 ALL_DD_LIMIT_YEN = -300_000   # 全系統合算月次DD上限（円）
 
 POLL_SEC = 0.4
+RECONCILE_INTERVAL = 60   # ブローカーポジション整合チェック間隔（秒）
 DRY_RUN       = True   # True=1570もDRY（注文なし）
 MICRO_DRY_RUN = True   # True=マイクロ先物もDRY（1570と独立して制御可能）
 
@@ -1517,6 +1518,83 @@ def cancel_micro_order(order_id):
     return False
 
 
+def get_actual_position(symbol) -> int:
+    """ブローカーの実際の純保有数量を返す（Long=+N, Short=-N, なし=0, 照会失敗=None）"""
+    res = request_with_reauth("GET", f"/positions?product=3&symbol={symbol}&addinfo=false")
+    if not res:
+        return None
+    data = safe_json(res)
+    if not isinstance(data, list):
+        return None
+    net = 0
+    for p in data:
+        qty = int(p.get("LeavesQty", 0))
+        net += qty if str(p.get("Side", "")) == "2" else -qty
+    return net
+
+
+def _reconcile_positions(now):
+    """定期ポジション整合チェック: net + gross の両方でブローカーと照合"""
+    if MICRO_DRY_RUN or not MICRO_SYMBOL:
+        return
+    with _positions_lock:
+        if not micro_dry_positions:
+            return
+        internal_net = sum(1 if p.get("side") == "long" else -1 for p in micro_dry_positions)
+        n_pos        = len(micro_dry_positions)
+
+    res = request_with_reauth("GET", f"/positions?product=3&symbol={MICRO_SYMBOL}&addinfo=false")
+    if not res:
+        log("[RECONCILE] /positions照会失敗 → スキップ")
+        return
+    data = safe_json(res)
+    if not isinstance(data, list):
+        log("[RECONCILE] /positions応答異常 → スキップ")
+        return
+
+    actual_net   = 0
+    actual_gross = 0
+    for p in data:
+        qty          = int(p.get("LeavesQty", 0))
+        actual_gross += qty
+        actual_net   += qty if str(p.get("Side", "")) == "2" else -qty
+
+    if actual_net == internal_net and actual_gross == n_pos:
+        return  # 完全一致
+
+    msg = (f"⚠️ポジション不一致 "
+           f"内部:net{internal_net:+d}/{n_pos}件 "
+           f"ブローカー:net{actual_net:+d}/gross{actual_gross}枚")
+    log(f"[RECONCILE] {msg}")
+    send_discord(msg)
+
+    if actual_gross == 0:
+        # ブローカー完全フラット → 全ポジション見逃し → ブラケット注文キャンセル後に内部クリア
+        with _positions_lock:
+            positions_to_close = list(micro_dry_positions)
+            micro_dry_positions.clear()
+        for pos in positions_to_close:
+            for key in ("sl_order_id", "tp_order_id"):
+                oid = pos.get(key)
+                if oid:
+                    cancel_micro_order(oid)
+            log(f"[RECONCILE] 系統{pos.get('system','?')} {pos.get('side','?')} → ブラケット注文キャンセル・内部削除")
+        _save_positions()
+        send_discord("⚠️TP/SL見逃し検知 → ブラケット注文キャンセル済・内部クリア（ブローカー既約定）")
+
+    elif actual_net * internal_net < 0:
+        # 逆ポジ（符号逆転）→ 緊急フラット
+        hhmm       = now.hour * 100 + now.minute
+        _sess_ex   = 24 if (hhmm >= 1540 or hhmm < 600) else 23
+        close_side = "buy" if actual_net < 0 else "sell"
+        rec_oid    = send_micro_order(close_side, _sess_ex)
+        if rec_oid:
+            send_discord(f"🚨逆ポジ緊急フラット → 成行発注 OrderId:{rec_oid}")
+        else:
+            send_discord(f"🚨最緊急 逆ポジフラット失敗 手動決済要")
+    # else: 部分的不一致（net相殺ケース等）→ Discord通知のみ・手動確認
+
+
 def _replace_sl_orders(session_exchange):
     """セッション切り替え時に既存SL（逆指値成行）をキャンセルして新セッションで再発注。
     session_exchange: 23=日中 / 24=夜間
@@ -1692,9 +1770,19 @@ def _monitor_micro_dry_inner(now, hhmm, micro_board, verbose):
                     if sl_oid:
                         ok = cancel_micro_order(sl_oid)
                         if not ok:
-                            msg = f"⚠️緊急 系統{sys_label} TP約定後SLキャンセル失敗(逆ポジの可能性) SL_OrderId:{sl_oid}"
+                            msg = f"⚠️緊急 系統{sys_label} TP約定後SLキャンセル失敗 SL_OrderId:{sl_oid}"
                             log(f"[ALERT] {msg}")
                             send_discord(msg)
+                            actual = get_actual_position(MICRO_SYMBOL)
+                            if actual is None:
+                                send_discord(f"⚠️緊急 系統{sys_label} /positions照会失敗 手動確認要")
+                            elif actual != 0:
+                                rec = "buy" if actual < 0 else "sell"
+                                rec_oid = send_micro_order(rec, _sess_ex)
+                                if rec_oid:
+                                    send_discord(f"⚠️緊急 系統{sys_label} 逆ポジ{actual:+d}枚検知→フラット成行 OrderId:{rec_oid}")
+                                else:
+                                    send_discord(f"🚨最緊急 系統{sys_label} 逆ポジ{actual:+d}枚 フラット成行発注失敗 手動決済要")
                     log(f"[LIVE] {prefix} TP到達 → SLキャンセル (TP指値はブローカー自動約定済み)")
                 elif reason == "SL到達":
                     # SL逆指値はブローカーが自動約定済み → TP指値キャンセルのみ
@@ -1702,9 +1790,19 @@ def _monitor_micro_dry_inner(now, hhmm, micro_board, verbose):
                     if tp_oid:
                         ok = cancel_micro_order(tp_oid)
                         if not ok:
-                            msg = f"⚠️緊急 系統{sys_label} SL約定後TPキャンセル失敗(逆ポジの可能性) TP_OrderId:{tp_oid}"
+                            msg = f"⚠️緊急 系統{sys_label} SL約定後TPキャンセル失敗 TP_OrderId:{tp_oid}"
                             log(f"[ALERT] {msg}")
                             send_discord(msg)
+                            actual = get_actual_position(MICRO_SYMBOL)
+                            if actual is None:
+                                send_discord(f"⚠️緊急 系統{sys_label} /positions照会失敗 手動確認要")
+                            elif actual != 0:
+                                rec = "buy" if actual < 0 else "sell"
+                                rec_oid = send_micro_order(rec, _sess_ex)
+                                if rec_oid:
+                                    send_discord(f"⚠️緊急 系統{sys_label} 逆ポジ{actual:+d}枚検知→フラット成行 OrderId:{rec_oid}")
+                                else:
+                                    send_discord(f"🚨最緊急 系統{sys_label} 逆ポジ{actual:+d}枚 フラット成行発注失敗 手動決済要")
                     log(f"[LIVE] {prefix} SL到達 → TPキャンセル (SL逆指値はブローカー自動約定済み)")
                 else:
                     # 強制決済（セッション終了・夜間終了・金曜夜間・土曜）: SL・TP両方キャンセル → 成行決済
@@ -2420,6 +2518,7 @@ def main():
     last_sl_replace_hhmm = -1   # SL再発注の重複実行防止
     last_pos_report_hhmm = -1   # 定時ポジション報告（8:30・16:45）
     last_hourly_report_h = -1   # 1時間ごとポジション報告
+    last_reconcile_time  = None  # ブローカーポジション整合チェック
 
     while True:
         now     = datetime.now(JST)
@@ -2429,19 +2528,9 @@ def main():
         if verbose:
             last_verbose_min = now.minute
 
-        # 土日・休場日は全処理スキップ（マイクロも休場）
-        # 土曜00:00〜05:59は金曜夜間セッション後半のため除外
-        is_sat_night_session = (weekday == 5 and hhmm < 600)
-        if (weekday >= 5 or is_holiday(now.date())) and not is_sat_night_session:
-            time.sleep(60)
-            continue
-
-        # ── 深夜終了判定 ──
-        # 金曜(weekday==4): 夜間セッションが翌朝05:55まで継続 → 23:50では終了しない
-        # 金曜以外: 23:50終了 / 土曜06:00以降: 金曜夜間後半終了 → 終了
-        is_session_end = (
-            (weekday == 5 and hhmm >= 600)        # 土曜06:00（金曜夜間後半終了後）
-        )
+        # ── 深夜終了判定（土日チェックより前に実行）──
+        # 土曜06:00は土日チェックが先に発動して continue してしまうため先行させる
+        is_session_end = (weekday == 5 and hhmm >= 600)
         if is_session_end:
             # 金曜夜間はポジション持越しNG（土曜はマーケット休場のため）
             # weekday==4(金)は23:50より前にマイクロポジションが閉じているはずだが
@@ -2466,6 +2555,13 @@ def main():
             _net_pt   = micro_dry_day_pnl - _n_trades * 2.2   # 往復手数料2.2pt×トレード数を控除
             log(f"[OK] 深夜終了  1570損益:{day_pnl:+.0f}円  マイクロDRY:{_net_pt:+.1f}pt(手数料控除後, {_n_trades}trades)  保有中:{len(micro_dry_positions)}件")
             break
+
+        # 土日・休場日は全処理スキップ（マイクロも休場）
+        # 土曜00:00〜05:59は金曜夜間セッション後半のため除外
+        is_sat_night_session = (weekday == 5 and hhmm < 600)
+        if (weekday >= 5 or is_holiday(now.date())) and not is_sat_night_session:
+            time.sleep(60)
+            continue
 
         # ── 認証エラー上限チェック ──
         if consecutive_auth_errors >= MAX_AUTH_ERRORS:
@@ -2501,7 +2597,7 @@ def main():
         # マイクロ先物は昼休みなし → 昼休み中も保存を継続
         # 15:40・15:45バー（日中最終2本）を取りこぼさないよう 1540〜1550 も含める
         _micro_save = is_trading_time(hhmm) or (1540 <= hhmm <= 1550) or (hhmm == 600)
-        if _micro_save and now.minute % 5 == 0 and now.minute != last_micro_csv_min and now.second < 2 and MICRO_SYMBOL:
+        if _micro_save and now.minute % 5 == 0 and now.minute != last_micro_csv_min and MICRO_SYMBOL:
             mdf = micro_bars_to_df()
             if mdf is not None:
                 save_micro_csv(mdf)
@@ -2575,6 +2671,12 @@ def main():
                         )
                     send_discord("⏱ 保有中\n" + "\n".join(lines))
                     last_hourly_report_h = now.hour
+
+        # ── ブローカーポジション整合チェック（60秒ごと）──
+        if not MICRO_DRY_RUN and micro_dry_positions:
+            if last_reconcile_time is None or (now - last_reconcile_time).total_seconds() >= RECONCILE_INTERVAL:
+                _reconcile_positions(now)
+                last_reconcile_time = now
 
         # ── 昼休み（1570のみ）──
         if 1130 <= hhmm < 1230:
