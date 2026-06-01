@@ -13,7 +13,7 @@ import backtest_system45_combined  as bt45
 
 # ======================================================
 # 系統⑥ トグル
-USE_SYSTEM6 = True   # 前日終値乖離逆張り（THRESH=250 EV=+16.30pt PF=1.552）
+USE_SYSTEM6 = False  # 前日終値乖離逆張り（THRESH=250 EV=+16.30pt PF=1.552）
 DD_6        = -15_000
 
 # 【系統④ 見直し履歴】
