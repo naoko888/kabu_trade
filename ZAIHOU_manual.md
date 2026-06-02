@@ -231,7 +231,7 @@ SL・TP のキャンセルに失敗した場合に実行する最終手段。
 
 ## 付録A: ファイル構成（リファクタリング進行中）
 
-最終更新: Phase 6 完了（2026-06-02）
+最終更新: Phase 7 完了（2026-06-02）
 
 ### Phase 進捗
 
@@ -243,7 +243,7 @@ SL・TP のキャンセルに失敗した場合に実行する最終手段。
 | 4 | zh_bar.py | バーデータ・WebSocket・ウォームアップ | ✅ 完了 |
 | 5 | zh_order.py | 発注・約定確認・SL/TP発注 | ✅ 完了 |
 | 6 | zh_monitor.py | 監視・決済・reconcile・replace | ✅ 完了 |
-| 7 | zh_entry.py | シグナル判定・エントリー実行 | 🔲 未着手 |
+| 7 | zh_entry.py | シグナル判定・エントリー実行 | ✅ 完了 |
 | 8 | ZAIHOU.py | main() のみ（起動・ループ制御） | 🔲 未着手 |
 
 ### 状態変数の所有モジュール（現在）
@@ -258,7 +258,7 @@ SL・TP のキャンセルに失敗した場合に実行する最終手段。
 | `positions` `day_pnl` `trade_log` | zh_monitor.py | zh_monitor.py |
 | `monthly_pnl_yen` `monthly_stopped` `monthly_ym` | zh_monitor.py | zh_monitor.py |
 | `_positions_lock` | zh_monitor.py | zh_monitor.py |
-| `last_signal_bar_time` `s4_last_bar` `s5_last_bar` `cpi_df` | ZAIHOU.py | zh_entry.py（Phase 7） |
+| `last_signal_bar_time` `s4_last_bar` `s5_last_bar` `cpi_df` | zh_entry.py | zh_entry.py |
 
 ### import の方向（循環 import 禁止）
 
@@ -274,11 +274,9 @@ zh_api ←── zh_bar（_bar_state / SYMBOL の参照）
      ZAIHOU.py（全モジュールを orchestrate）
 ```
 
-### ZAIHOU.py に現在「一時避難中」の処理
+### ZAIHOU.py に現在残存している処理
 
-| 処理 | 移動先 | タイミング |
-|---|---|---|
-| エントリー関数群（_enter_position / _close_opposite / check_entry） | zh_entry.py | Phase 7 |
+ZAIHOU.py は現在 main() + ループ制御のみ。Phase 8 で最終整理予定。
 
 ### 設計判断メモ（次回セッションで参照）
 
@@ -297,10 +295,21 @@ zh_api ←── zh_bar（_bar_state / SYMBOL の参照）
 
 | No | 確認内容 | 影響 | 状態 |
 |---|---|---|---|
-| C1 | `/orders` Details.RecType の定義値（約定明細の値は 8 か？） | wait_for_fill() が常にタイムアウトするリスク | ⏸ 保留 |
-| C2 | ReverseLimitOrder.AfterHitOrderType の定義値（1=成行か？） | SL 逆指値発注の動作が意図通りか | ⏸ 保留 |
-| C3 | ExecutionID の採番規則（文字列辞書順で最新が最大になるか？） | get_hold_id() の判定精度 | ⏸ 保留 |
-| C4 | /positions の HoldQty の意味（他注文に拘束中の数量か？） | 将来の get_hold_id() 簡素化に影響 | ⏸ 保留 |
+| C1 | `/orders` Details.RecType の定義値（約定明細の値は 8 か？） | wait_for_fill() が常にタイムアウトするリスク | ⏸ 保留（API仕様書に定義なし） |
+| C2 | ReverseLimitOrder.AfterHitOrderType の定義値（1=成行か？） | SL 逆指値発注の動作が意図通りか | ✅ サンプル確認（AfterHitOrderType:1 + AfterHitPrice:0 = 成行） |
+| C3 | ExecutionID の採番規則（文字列辞書順で最新が最大になるか？） | get_hold_id() の判定精度 | ⏸ 保留（形式は "E日付xxx" と判明、順序保証は未確認） |
+| C4 | /positions の HoldQty の意味（他注文に拘束中の数量か？） | 将来の get_hold_id() 簡素化に影響 | ✅ サンプル確認（HoldQty=0 実例あり、拘束数量を意味する） |
+
+#### API 仕様追加確認事項（2026-06-02）
+
+| フィールド | 確認内容 |
+|---|---|
+| FrontOrderType=120 | 成行（マーケットオーダー）確定 |
+| FrontOrderType=30 | 逆指値確定 |
+| FrontOrderType=20 | 指値確定 |
+| TimeInForce=2（FAK）+ 成行 | Exchange=23/24 のみ有効。**日通し(2)は不可**。_sess_exchange は 23/24 のみ返すため問題なし |
+| ClosePositions と ClosePositionOrder | 排他的（両方指定するとエラー）。コードは正しく either/or で分岐済み |
+| ExecutionID | "E"で始まる建玉ID。ClosePositions[].HoldID に渡す値と一致 |
 
 #### 今は修正しない潜在リスク
 
