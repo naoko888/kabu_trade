@@ -7,9 +7,7 @@ auto_trade.py のマイクロ先物部分を完全置き換え。
 import sys
 sys.stdout.reconfigure(encoding="utf-8")
 
-import json
 import time
-import threading
 import traceback
 from datetime import datetime, timedelta
 
@@ -24,9 +22,9 @@ from zh_config import (
     API_PASSWORD,
     DERIV_MONTH, NEXT_DERIV_MONTH, LOT,
     DRY_RUN, DD_LIMIT_YEN,
-    LOG_DIR, OPEN_POS_FILE,
+    LOG_DIR,
     POLL_SEC, RECONCILE_INTERVAL,
-    PT_TO_YEN, COMMISSION_YEN, TICK_UNIT,
+    PT_TO_YEN, COMMISSION_YEN,
     MAX_AUTH_ERRORS,
     JST,
 )
@@ -439,9 +437,9 @@ def main():
                         zh_monitor.positions[:] = surviving
                         zh_monitor.save_positions()
             else:
-                log("[WARN] 起動時 /zh_monitor.positions異常レスポンス → ファイル内容をそのまま使用")
+                log("[WARN] 起動時 /positions異常レスポンス → ファイル内容をそのまま使用")
         else:
-            log("[WARN] 起動時 /zh_monitor.positions照会失敗 → ファイル内容をそのまま使用")
+            log("[WARN] 起動時 /positions照会失敗 → ファイル内容をそのまま使用")
 
     # ── 起動時 SL/TP 再発注（保有ポジションがある場合）──
     if zh_monitor.positions and not DRY_RUN:

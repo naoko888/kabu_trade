@@ -231,7 +231,7 @@ SL・TP のキャンセルに失敗した場合に実行する最終手段。
 
 ## 付録A: ファイル構成（リファクタリング進行中）
 
-最終更新: Phase 5 完了（2026-06-02）
+最終更新: Phase 6 完了（2026-06-02）
 
 ### Phase 進捗
 
@@ -242,7 +242,7 @@ SL・TP のキャンセルに失敗した場合に実行する最終手段。
 | 3 | zh_api.py | 認証・API通信・銘柄管理 | ✅ 完了 |
 | 4 | zh_bar.py | バーデータ・WebSocket・ウォームアップ | ✅ 完了 |
 | 5 | zh_order.py | 発注・約定確認・SL/TP発注 | ✅ 完了 |
-| 6 | zh_monitor.py | 監視・決済・reconcile・replace | 🔲 未着手 |
+| 6 | zh_monitor.py | 監視・決済・reconcile・replace | ✅ 完了 |
 | 7 | zh_entry.py | シグナル判定・エントリー実行 | 🔲 未着手 |
 | 8 | ZAIHOU.py | main() のみ（起動・ループ制御） | 🔲 未着手 |
 
@@ -255,9 +255,9 @@ SL・TP のキャンセルに失敗した場合に実行する最終手段。
 | `consecutive_auth_errors` `last_reauth_time` | zh_api.py | zh_api.py |
 | `completed_bars` `current_bar` `last_cum_vol` | zh_bar.py | zh_bar.py |
 | `warmup_remaining` `can_trade` | zh_bar.py | zh_bar.py |
-| `positions` `day_pnl` `trade_log` | ZAIHOU.py | zh_monitor.py（Phase 6） |
-| `monthly_pnl_yen` `monthly_stopped` `monthly_ym` | ZAIHOU.py | zh_monitor.py（Phase 6） |
-| `_positions_lock` | ZAIHOU.py | zh_monitor.py（Phase 6） |
+| `positions` `day_pnl` `trade_log` | zh_monitor.py | zh_monitor.py |
+| `monthly_pnl_yen` `monthly_stopped` `monthly_ym` | zh_monitor.py | zh_monitor.py |
+| `_positions_lock` | zh_monitor.py | zh_monitor.py |
 | `last_signal_bar_time` `s4_last_bar` `s5_last_bar` `cpi_df` | ZAIHOU.py | zh_entry.py（Phase 7） |
 
 ### import の方向（循環 import 禁止）
@@ -278,16 +278,14 @@ zh_api ←── zh_bar（_bar_state / SYMBOL の参照）
 
 | 処理 | 移動先 | タイミング |
 |---|---|---|
-| `_ws_check_sl_tp()` | zh_monitor.py | Phase 6 |
-| 監視・決済関数群（monitor_positions 等） | zh_monitor.py | Phase 6 |
-| エントリー関数群（check_entry 等） | zh_entry.py | Phase 7 |
+| エントリー関数群（_enter_position / _close_opposite / check_entry） | zh_entry.py | Phase 7 |
 
 ### 設計判断メモ（次回セッションで参照）
 
 - **_collect_symbols / _bar_state が zh_api.py にある理由**: `register_symbol()` と `_init_collect_symbols()` が API 通信と bar 状態を両方触るため、循環 import を避けるため zh_api.py が一時所有。
-- **_ws_check_sl_tp が ZAIHOU.py にある理由**: `positions` と `monitor_positions()` を参照するため。Phase 6 で zh_monitor.py が両方を持つまで移動できない。
 - **_bar_state_lock を新設した理由**: WebSocket スレッドとメインループ間で `_bar_state` を保護するため。`_positions_lock`（positions 保護用）とは別ロックにすることでロック競合を避ける。
 - **global 宣言に注意**: Python の `global` は dotted name（`zh_bar.foo` 等）を受け付けない。replace_all で変数名を置換する際は事前に `global` 宣言行を確認して手動修正する。
+- **zh_monitor.py が ZAIHOU_signals に依存する理由**: `_SL_MAP` / `_TP_MAP` / `_MH_MAP` の参照のため。Phase 7 以降で zh_entry.py が持つべき情報だが、現時点では zh_monitor.py が保有（設計懸念 D1）。
 
 ---
 
@@ -295,14 +293,14 @@ zh_api ←── zh_bar（_bar_state / SYMBOL の参照）
 
 ### Phase 5 レビュー（zh_order.py / 2026-06-02）
 
-#### 要カブコム確認事項
+#### 要カブコム確認事項（保留中・本番移行前に要確認）
 
 | No | 確認内容 | 影響 | 状態 |
 |---|---|---|---|
-| C1 | `/orders` Details.RecType の定義値（約定明細の値は 8 か？） | wait_for_fill() が常にタイムアウトするリスク | 未確認 |
-| C2 | ReverseLimitOrder.AfterHitOrderType の定義値（1=成行か？） | SL 逆指値発注の動作が意図通りか | 未確認 |
-| C3 | ExecutionID の採番規則（文字列辞書順で最新が最大になるか？） | get_hold_id() の判定精度 | 未確認 |
-| C4 | /positions の HoldQty の意味（他注文に拘束中の数量か？） | 将来の get_hold_id() 簡素化に影響 | 未確認 |
+| C1 | `/orders` Details.RecType の定義値（約定明細の値は 8 か？） | wait_for_fill() が常にタイムアウトするリスク | ⏸ 保留 |
+| C2 | ReverseLimitOrder.AfterHitOrderType の定義値（1=成行か？） | SL 逆指値発注の動作が意図通りか | ⏸ 保留 |
+| C3 | ExecutionID の採番規則（文字列辞書順で最新が最大になるか？） | get_hold_id() の判定精度 | ⏸ 保留 |
+| C4 | /positions の HoldQty の意味（他注文に拘束中の数量か？） | 将来の get_hold_id() 簡素化に影響 | ⏸ 保留 |
 
 #### 今は修正しない潜在リスク
 
@@ -310,8 +308,30 @@ zh_api ←── zh_bar（_bar_state / SYMBOL の参照）
 |---|---|---|
 | B3 | get_hold_id() | ExecutionID を文字列比較で最新判定。採番規則依存 |
 | B4 | send_sl_order() / send_tp_order() | HoldID なし時は ClosePositionOrder=0（FIFO）フォールバック。複数ポジション時に意図しない建玉返済リスク |
-| D1 | _monitor_inner（ZAIHOU.py 残存） | 緊急返済を zh_order 経由せず直接 request_with_reauth で発注。Phase 6 で整理 |
-| D2 | _enter_position（ZAIHOU.py 残存） | 同上。Phase 7 で整理 |
+
+---
+
+### Phase 6 レビュー（zh_monitor.py / 2026-06-02）
+
+#### 検証結果
+
+- ZAIHOU2026.5.27.py との比較でロジック差分なし（`_TICK=5` → `TICK_UNIT` のみ、等価）
+- 全関数呼び出しの prefix（zh_api. / zh_order.）正しく変換済み
+
+#### 今は修正しない潜在リスク
+
+| No | 箇所 | 内容 |
+|---|---|---|
+| P1 | _monitor_inner: SL到達パス | sl_oid=None 時、TP のみキャンセルし実決済注文なしでポジションを記録から削除する。本番で裸ポジションが残る可能性 |
+| P2 | _monitor_inner: MAX_HOLD 判定 | `elapsed >= max_hold` は「以上」。マニュアルの「超えた場合」との境界の解釈要確認（1本ずれの可能性） |
+
+#### 設計懸念（ロジック変更が必要なため保留）
+
+| No | 内容 |
+|---|---|
+| D1 | zh_monitor.py が ZAIHOU_signals に依存（SL/TP/MAX_HOLD パラメータ参照）。責務上は zh_entry.py が持つべき |
+| D2 | _close_opposite（ZAIHOU.py）が zh_monitor の状態変数を直接書き換え。月次 DD 判定が 2 箇所に分散 |
+| D3 | reconcile_positions のロック間 race condition。2 回の _positions_lock 取得の間に monitor_positions が割り込める |
 
 #### 将来の簡素化候補（提案のみ・未実装）
 
