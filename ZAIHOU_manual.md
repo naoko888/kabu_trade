@@ -368,3 +368,40 @@ ZAIHOU.py は `main()` のみ（起動・ループ制御）。リファクタリ
 |---|---|---|
 | PB1 | check_entry: `_close_opposite` の呼び出し | `_close_opposite` が逆ポジ決済の約定未確認で `return` しても、その後の `_enter_position` 呼び出しはスキップされない（コメントの「新規エントリースキップ」は実態と一致しない） |
 | PB2 | `_close_opposite`: `to_close` リスト構築 | `_positions_lock` 非保持で `zh_monitor.positions` を読む。WebSocket スレッドとの競合リスクあり（D3 と同根） |
+
+---
+
+## 付録C: 次期設計変更の方向性
+
+### 2大優先判断（未決定・要合意）
+
+次の設計変更を行うかどうかが、削除できるコードの量と複雑さに大きく影響する。
+
+| No | 判断 | Yes の場合に削除できるもの |
+|---|---|---|
+| **J1** | TP/SL をブローカー注文なしにする（ソフトウェア価格監視のみ） | send_sl_order / send_tp_order / cancel_order / check_order_active / replace_close_orders の大半 |
+| **J2** | open_positions.json を廃止しブローカー API を正とする | reconcile_positions / save_positions / load_positions / Bug4（ゴーストポジション）が根本解決 |
+
+**J1 → Yes にすると J2 も自然に Yes になる**（SL/TP 注文がないため HoldID 管理も不要になり、状態の二重管理が解消される）。
+
+---
+
+### 設計変更の方向性（原則ごと）
+
+| 原則 | 現状の問題 | 方向性 |
+|---|---|---|
+| ① Single Source of Truth | `open_positions.json` と ブローカー `/positions` の二重管理 → Bug4（ゴースト） | 起動時にブローカー API から取得。`open_positions.json` は廃止か補助のみ |
+| ② 暗黙の前提条件を排除 | `wait_for_fill → get_hold_id → send_sl_order` の順序依存 → Bug3（HoldID 無効で SL/TP 全滅） | 連鎖ごと削除。TP/SL はソフトウェア価格監視のみにする |
+| ③ ピュアな関数 | `check_entry()` がシグナル判定・状態変更・発注を一気に行う | `get_signal(bars) → Signal \| None`（純粋）と `execute_entry(signal)`（副作用）に分離 |
+| ④ 検証は1箇所で | 認証エラー処理が `request_with_reauth` / `_monitor_inner` 等に散在 | `request_with_reauth()` 内に集約。5回終了 → 指数バックオフで継続 |
+| ⑤ 早期 return | `_monitor_inner()` がネスト 5 階層以上 | 条件ごとに早期 return して平坦化 |
+| ⑥ 念のためのコードを書かない | `reconcile_positions()` が存在するのは `open_positions.json` が信頼できないから | ① を解決すれば reconcile 自体が不要になる |
+| ⑦ DRY / 単純化 | `_collect_symbols` / `_bar_state` による複数シンボル管理フレームが複雑 | 日経 225 マイクロ 1 本に絞り削除（翌限月バー収集の廃止） |
+| ⑧ シークレット管理 | `API_PASSWORD = "sakimono35oku"` がコードにハードコード | 環境変数または設定ファイル（`secrets.json` 等）に移動 |
+
+---
+
+### 変更しない場合のリスク
+
+- **J1 を No にする場合**: Bug3（HoldID 無効 SL/TP 全滅）が本番で発生するリスクが残る。再起動ごとに SL/TP 再発注が必要で、その都度失敗する可能性がある。
+- **J2 を No にする場合**: Bug4（ゴーストポジション）が再発する可能性がある。`reconcile_positions` による検知に依存し続けることになる。
