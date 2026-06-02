@@ -58,6 +58,7 @@ def wait_for_fill(order_id: str, max_retries: int = 10, interval: float = 1.0) -
             details = order.get("Details") or []
             qty_sum = val_sum = 0.0
             for d in details:
+                log(f"[DEBUG] RecType: {d.get('RecType')}, Price: {d.get('Price')}")  # 一時調査用
                 if d.get("RecType") == 8:  # 約定明細
                     q = float(d.get("Qty") or 0)
                     p = float(d.get("Price") or 0)
@@ -111,39 +112,6 @@ def get_hold_id(entry_side: str, existing_ids: set | None) -> str | None:
     log(f"[HOLD] HoldID取得: {hid}")
     return hid if hid else None
 
-
-def send_sl_order(side: str, sl_price: float, session_exchange: int,
-                  hold_id: str | None = None) -> str | None:
-    """SL逆指値→成行発注（先物専用 /sendorder/future）. side=エントリー方向("buy"|"sell")"""
-    if DRY_RUN:
-        return None
-    exit_side  = "2" if side == "sell" else "1"  # 先物: 1=売 / 2=買（株式と逆）
-    under_over = 2   if side == "sell" else 1   # SHORT→以上(上抜け) / LONG→以下(下抜け)
-    body = {
-        "Password": API_PASSWORD, "Symbol": zh_api.SYMBOL,
-        "Exchange": session_exchange,
-        "TradeType": 2,
-        "TimeInForce": 2,    # FAK（逆指値→成行はFAK必須）
-        "Side": exit_side,
-        "Qty": LOT, "Price": 0, "ExpireDay": 0,
-        "FrontOrderType": 30,
-        "ReverseLimitOrder": {
-            "TriggerPrice": sl_price,
-            "UnderOver": under_over,
-            "AfterHitOrderType": 1, "AfterHitPrice": 0,
-        },
-    }
-    if hold_id:
-        body["ClosePositions"] = [{"HoldID": hold_id, "Qty": LOT}]
-    else:
-        body["ClosePositionOrder"] = 0
-    res = zh_api.request_with_reauth("POST", "/sendorder/future", json_body=body)
-    if res:
-        oid = safe_json(res).get("OrderId", "")
-        log(f"[OK] SL逆指値発注 Exchange:{session_exchange} Trigger:{sl_price:.0f} OrderId:{oid}")
-        return oid
-    log(f"[ERR] SL発注失敗 Trigger:{sl_price:.0f}")
-    return None
 
 
 def send_tp_order(side: str, tp_price: float, session_exchange: int,

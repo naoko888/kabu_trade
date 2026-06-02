@@ -1,23 +1,22 @@
 """
 zh_entry.py
 シグナル判定・エントリー実行・逆ポジ決済。
-依存: zh_config, zh_utils, zh_api, zh_bar, zh_order, zh_monitor, ZAIHOU_signals
+依存: zh_config, zh_utils, zh_bar, zh_order, zh_monitor, ZAIHOU_signals
 """
 import time
 from datetime import datetime, timedelta
 
 import pandas as pd
 import ZAIHOU_signals as sig
-import zh_api
 import zh_bar
 import zh_order
 import zh_monitor
 from zh_config import (
-    API_PASSWORD, DRY_RUN, LOT,
+    DRY_RUN,
     PT_TO_YEN, COMMISSION_YEN,
     DD_LIMIT_YEN, LOG_DIR,
 )
-from zh_utils import log, send_discord, safe_json, _sess_exchange, _board_price
+from zh_utils import log, send_discord, _sess_exchange, _board_price
 
 # ==========================================================================
 # 状態（このモジュールが所有）
@@ -110,50 +109,14 @@ def _enter_position(system: str, side: str, cp: float, board: dict,
     hold_id = zh_order.get_hold_id(order_side, existing_ids)
     if not hold_id:
         log(f"[WARN] 系統{system} HoldID取得失敗 → ClosePositionOrder=0で代替")
-    sl_oid = zh_order.send_sl_order(order_side, pos["sl_price"], session_exchange, hold_id)
+    # SLはソフトウェア価格監視のみ（ブローカーSL注文なし）
     tp_oid = zh_order.send_tp_order(order_side, pos["tp_price"], session_exchange, hold_id)
-    pos["sl_order_id"] = sl_oid
     pos["tp_order_id"] = tp_oid
     pos["order_id"]    = oid
     pos["hold_id"]     = hold_id
-    log(f"[ORDER] SL_OrderId:{sl_oid}  TP_OrderId:{tp_oid}  HoldID:{hold_id}")
+    log(f"[ORDER] TP_OrderId:{tp_oid}  HoldID:{hold_id}")
 
-    # SL受付確認
-    if sl_oid:
-        sl_result = zh_order.check_order_active(sl_oid)
-        if sl_result is False:
-            # 非アクティブ確定 → 裸ポジ → TP取消・緊急返済
-            msg = f"⚠️ 系統{system} SL非アクティブ確定(裸ポジ) → TP取消・緊急返済"
-            log(f"[WARN] {msg}"); send_discord(msg)
-            if tp_oid:
-                zh_order.cancel_order(tp_oid)
-            close_side = "sell" if side == "long" else "buy"
-            if hold_id:
-                _body = {
-                    "Password": API_PASSWORD, "Symbol": zh_api.SYMBOL,
-                    "Exchange": session_exchange,
-                    "TradeType": 2, "TimeInForce": 2,
-                    "Side": "1" if close_side == "sell" else "2",
-                    "Qty": LOT, "Price": 0, "ExpireDay": 0,
-                    "FrontOrderType": 120,
-                    "ClosePositions": [{"HoldID": hold_id, "Qty": LOT}],
-                }
-                res_cl = zh_api.request_with_reauth("POST", "/sendorder/future", json_body=_body)
-                if res_cl:
-                    log(f"[OK] 緊急返済発注(HoldID指定) OrderId:{safe_json(res_cl).get('OrderId','')}")
-                else:
-                    send_discord(f"🚨緊急 系統{system} 緊急返済失敗 手動決済要 HoldID:{hold_id}")
-            else:
-                oid_em = zh_order.send_entry_order(close_side, session_exchange, trade_type=2)
-                if not oid_em:
-                    send_discord(f"🚨緊急 系統{system} 緊急返済失敗 手動決済要")
-            return  # zh_monitor.positions に追加しない
-        elif sl_result is None:
-            # 通信不明 → 警告のみ（reconcileに委ねる）
-            log(f"[WARN] 系統{system} SL注文確認不能(通信不明) → 継続監視")
-            send_discord(f"⚠️ 系統{system} SL注文確認不能 OrderId:{sl_oid}")
-
-    # TP受付確認（SL生存中のため通知のみ）
+    # TP受付確認
     if tp_oid and zh_order.check_order_active(tp_oid) is False:
         log(f"[WARN] 系統{system} TP注文非アクティブ確定 OrderId:{tp_oid}")
         send_discord(f"⚠️ 系統{system} TP注文非アクティブ確定 OrderId:{tp_oid}")
