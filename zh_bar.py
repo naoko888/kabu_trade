@@ -109,6 +109,22 @@ def save_micro_csv(df: pd.DataFrame, path=None) -> None:
     df_save = df_save.iloc[sort_keys.argsort(kind="stable")]
     df_save.to_csv(p, encoding="utf-8-sig", index_label="datetime")
 
+def save_collect_csv() -> None:
+    """翌限月等の収集シンボルのバーデータを CSV に保存する"""
+    for sym, csv_path in zh_api._collect_symbols.items():
+        if sym == zh_api.SYMBOL:
+            continue
+        with _bar_state_lock:
+            st   = zh_api._bar_state.get(sym, {})
+            rows = st.get("completed", [])[:]
+            if st.get("current"):
+                rows.append(st["current"].copy())
+        if rows:
+            tmp = pd.DataFrame(rows)
+            tmp["datetime"] = pd.to_datetime(tmp["datetime"])
+            tmp = tmp.drop_duplicates(subset=["datetime"], keep="last")
+            save_micro_csv(tmp, path=csv_path)
+
 # ==========================================================================
 # ウォームアップ
 # ==========================================================================
@@ -224,3 +240,19 @@ def start_ws() -> None:
         ws.run_forever()
     threading.Thread(target=_run, daemon=True).start()
     log("[OK] WebSocket起動")
+
+def update_from_board(hhmm: int, board: dict, now_naive) -> None:
+    """ウォールクロックで main bar を補完（WebSocket tick が来ない時間帯向け）
+    vol_delta=0 のため WebSocket 由来のボリュームは上書きしない。
+    境界: 夜間後半〜6:00 / 日中〜15:45 のみ。6:05・15:50 は幽霊バーを防ぐため除外。
+    """
+    if not zh_api.SYMBOL or not board:
+        return
+    cp = board.get("CurrentPrice")
+    if not cp:
+        return
+    if not ((845 <= hhmm <= 1545) or hhmm >= 1700 or hhmm <= 600):
+        return
+    _bt_now = sig._adjust_trading_day(floor_5min(now_naive))
+    if current_bar is None or current_bar.get("datetime") != _bt_now:
+        _update_main_bar(_bt_now, float(cp), 0)

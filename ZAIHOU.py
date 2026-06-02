@@ -11,7 +11,6 @@ import time
 import traceback
 from datetime import datetime
 
-import pandas as pd
 import ZAIHOU_signals as sig
 import zh_api
 import zh_bar
@@ -25,7 +24,7 @@ from zh_config import (
     JST,
 )
 from zh_utils import (
-    floor_5min, send_discord, log, safe_json,
+    send_discord, log, safe_json,
     is_holiday, _sess_exchange, _board_price,
 )
 
@@ -178,14 +177,7 @@ def main():
         board = zh_api.get_board()
 
         # ── ボード参照バー補完（volume=0 時間帯も 5 分足を補完）──
-        # WebSocket tick が来ない時間帯（5:55 など）でもウォールクロックでバー時刻を進める。
-        # vol_delta=0 のため WebSocket 由来のボリュームは上書きしない。
-        # 境界: 夜間後半〜6:00 / 日中〜15:45 のみ。6:05・15:50 は幽霊バーを防ぐため除外。
-        _board_trading = ((845 <= hhmm <= 1545) or hhmm >= 1700 or hhmm <= 600)
-        if _board_trading and zh_api.SYMBOL and board and board.get("CurrentPrice"):
-            _bt_now = sig._adjust_trading_day(floor_5min(now.replace(tzinfo=None)))
-            if zh_bar.current_bar is None or zh_bar.current_bar.get("datetime") != _bt_now:
-                zh_bar._update_main_bar(_bt_now, float(board["CurrentPrice"]), 0)
+        zh_bar.update_from_board(hhmm, board, now.replace(tzinfo=None))
 
         # ── CSV保存 (5分ごと) ──
         _save_ok = ((845 <= hhmm < 1540) or (hhmm >= 1700) or (hhmm <= 605)
@@ -194,19 +186,7 @@ def main():
             mdf = zh_bar.bars_to_df()
             if mdf is not None:
                 zh_bar.save_micro_csv(mdf)
-            for sym, csv_path in zh_api._collect_symbols.items():
-                if sym == zh_api.SYMBOL:
-                    continue
-                with zh_bar._bar_state_lock:
-                    st   = zh_api._bar_state.get(sym, {})
-                    rows = st.get("completed", [])[:]
-                    if st.get("current"):
-                        rows.append(st["current"].copy())
-                if rows:
-                    tmp = pd.DataFrame(rows)
-                    tmp["datetime"] = pd.to_datetime(tmp["datetime"])
-                    tmp = tmp.drop_duplicates(subset=["datetime"], keep="last")
-                    zh_bar.save_micro_csv(tmp, path=csv_path)
+            zh_bar.save_collect_csv()
             last_micro_csv_min = now.minute
 
         # ── ポジション監視 / エントリー判定 ──
