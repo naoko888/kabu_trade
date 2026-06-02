@@ -295,7 +295,7 @@ ZAIHOU.py は `main()` のみ（起動・ループ制御）。リファクタリ
 
 | No | 確認内容 | 影響 | 状態 |
 |---|---|---|---|
-| C1 | `/orders` Details.RecType の定義値（約定明細の値は 8 か？） | wait_for_fill() が常にタイムアウトするリスク | ⏸ 保留（API仕様書に定義なし） |
+| C1 | `/orders` Details.RecType の定義値（約定明細の値は 8 か？） | wait_for_fill() が常にタイムアウトするリスク | ⏸ 保留（API仕様書に定義なし・実機確認要） |
 | C2 | ReverseLimitOrder.AfterHitOrderType の定義値（1=成行か？） | SL 逆指値発注の動作が意図通りか | ✅ サンプル確認（AfterHitOrderType:1 + AfterHitPrice:0 = 成行） |
 | C3 | ExecutionID の採番規則（文字列辞書順で最新が最大になるか？） | get_hold_id() の判定精度 | ⏸ 保留（形式は "E日付xxx" と判明、順序保証は未確認） |
 | C4 | /positions の HoldQty の意味（他注文に拘束中の数量か？） | 将来の get_hold_id() 簡素化に影響 | ✅ サンプル確認（HoldQty=0 実例あり、拘束数量を意味する） |
@@ -310,6 +310,18 @@ ZAIHOU.py は `main()` のみ（起動・ループ制御）。リファクタリ
 | TimeInForce=2（FAK）+ 成行 | Exchange=23/24 のみ有効。**日通し(2)は不可**。_sess_exchange は 23/24 のみ返すため問題なし |
 | ClosePositions と ClosePositionOrder | 排他的（両方指定するとエラー）。コードは正しく either/or で分岐済み |
 | ExecutionID | "E"で始まる建玉ID。ClosePositions[].HoldID に渡す値と一致 |
+
+#### C1 実機確認手順
+
+1. `zh_order.py` の `wait_for_fill` 内、`for d in details:` の先頭に下記を一時追加する
+   ```python
+   log(f"[DEBUG] RecType: {d.get('RecType')}, Price: {d.get('Price')}")
+   ```
+2. `DRY_RUN = False` で起動し、シグナル発生 → 約定を待つ
+3. `CumQty >= 1` になると `Details` 配列がループされ `[DEBUG]` ログが出力される
+4. RecType の実際の値を確認したらデバッグ行を削除し C1 を解決済みに更新する
+
+※ API 仕様書には `Details` 内フィールドの定義なし。実機確認が唯一の方法。
 
 #### 今は修正しない潜在リスク
 
