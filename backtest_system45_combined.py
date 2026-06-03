@@ -62,13 +62,13 @@ SHORT_PARAM = {
 }
 
 # 時間帯デフォルト（bar END hour 基準）
-S4_HOURS_DST = (14, 15, 16, 17, 23)
-S4_HOURS_WIN = (14, 15, 16, 17, 23)
+S4_HOURS_DST = (14, 15, 17, 23)
+S4_HOURS_WIN = (14, 15, 17, 23)
 S5_HOURS_DST = (14, 15, 22)                    # 除外: 5,20,21,23（全確認済）
 S5_HOURS_WIN = (8, 12, 14, 15, 22)            # 除外: 5,20,21,23（全確認済）
 
-S4_WEEKDAYS  = (0, 1, 2, 3, 4)   # 全曜日
-S5_WEEKDAYS  = (0, 1, 2, 3, 4)
+S4_WEEKDAYS  = (0, 1, 2, 3, 4, 6)   # 全曜日 + 月曜日中(物理月曜 hour<17 → wd=6)
+S5_WEEKDAYS  = (0, 1, 2, 3, 4, 6)
 S4_EXCL_MONTHS: tuple = (7,)
 S5_EXCL_MONTHS: tuple = (1, 7)
 
