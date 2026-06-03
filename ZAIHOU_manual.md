@@ -285,6 +285,7 @@ ZAIHOU.py は `main()` のみ（起動・ループ制御）。リファクタリ
 - **_bar_state_lock を新設した理由**: WebSocket スレッドとメインループ間で `_bar_state` を保護するため。`_positions_lock`（positions 保護用）とは別ロックにすることでロック競合を避ける。
 - **global 宣言に注意**: Python の `global` は dotted name（`zh_bar.foo` 等）を受け付けない。replace_all で変数名を置換する際は事前に `global` 宣言行を確認して手動修正する。
 - **zh_monitor.py が ZAIHOU_signals に依存する理由**: `_SL_MAP` / `_TP_MAP` / `_MH_MAP` の参照のため。Phase 7 以降で zh_entry.py が持つべき情報だが、現時点では zh_monitor.py が保有（設計懸念 D1）。
+- **`_adjust_trading_day` による曜日判定の動作**: バーの datetime は `_adjust_trading_day` で補正済み（17:00以降 → 翌取引日付）。シグナル判定の曜日・時刻フィルターはこの補正後 datetime を使用するため、**夜間バーの weekday は物理日ではなく翌取引日の weekday** になる。例: 2026-06-02（火）17:00 のバーは 2026-06-03（水）17:00 として扱われ、③ の S3_WEEKDAYS 判定が水曜（wd=2）で行われる。これは設計通りの動作（trading day convention）。BT 側のパフォーマンス比較スクリプトがこの変換を考慮していなかったため、2026-06-03 に `micro_performance_summary.py` の照合キーを trade_date ベースに修正した。
 
 ---
 
@@ -381,6 +382,28 @@ ZAIHOU.py は `main()` のみ（起動・ループ制御）。リファクタリ
 |---|---|---|
 | PB1 | check_entry: `_close_opposite` の呼び出し | `_close_opposite` が逆ポジ決済の約定未確認で `return` しても、その後の `_enter_position` 呼び出しはスキップされない（コメントの「新規エントリースキップ」は実態と一致しない） |
 | PB2 | `_close_opposite`: `to_close` リスト構築 | `_positions_lock` 非保持で `zh_monitor.positions` を読む。WebSocket スレッドとの競合リスクあり（D3 と同根） |
+
+---
+
+### 実弾テスト記録（DRY_RUN=False / 2026-06-03）
+
+#### 確認済み
+
+| 項目 | 結果 |
+|---|---|
+| エントリーフロー | ✅ 成行発注 → 約定確認(1回) → 価格取得 正常動作（系統⑤ short @ 68725） |
+| HoldID 取得 | ✅ ExecutionID 正常取得（E2026060305PI1） |
+| TP 指値発注 | ✅ Exchange=23 で正常発注 |
+| J2（0件起動） | ✅ ブローカーから 0 件復元 正常動作 |
+| C1（RecType=8） | ✅ 付録B Phase5 参照 |
+
+#### 未確認（本番モードで状況発生待ち）
+
+| 項目 | 理由 |
+|---|---|
+| J2（ポジションあり再起動） | DRY_RUN=True で誤再起動したため未検証 |
+| TP 到達 | `/positions` 消滅確認ロジック未実施 |
+| SL 到達 | 成行発注 → `wait_for_fill` フロー未実施 |
 
 ---
 
