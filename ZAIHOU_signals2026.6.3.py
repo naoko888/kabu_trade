@@ -1,6 +1,6 @@
 """
 ZAIHOU_signals.py
-N225マイクロ先物 系統①③④⑤ 共通シグナルモジュール
+N225マイクロ先物 系統①③④⑤⑥ 共通シグナルモジュール
 
 BT (ZAIHOU_bt.py) と 実運用 (ZAIHOU.py) の両方から import。
 グローバル状態を持たない純粋関数として設計。
@@ -9,12 +9,13 @@ BT (ZAIHOU_bt.py) と 実運用 (ZAIHOU.py) の両方から import。
   系統① : bar END hour    hr = (dt.hour*60 + dt.minute + 5) // 60 % 24
   系統③ : bar START hour  hr = dt.hour
   系統④⑤: bar END hour    hr = (dt.hour*60 + dt.minute - 5) // 60 % 24  (BT45と同式)
+  系統⑥ : bar START hour  hr = dt.hour
 
 月除外の補正（auto_trade.py の 5月漏れバグを修正）:
   ①: S1_EXCL_MONTHS = (3, 5, 11)  ← BT確認済み / auto_trade.py は (3,11) のみ
   ③: S3_EXCL_MONTHS = (5, 7, 11)  ← BT確認済み / auto_trade.py は (7,11) のみ
 
-CPI除外対象: ③⑤（④は対象外）
+CPI除外対象: ③⑤⑥（④は対象外）
 ④⑤ 曜日フィルターなし（BTで全曜日 0–4 を確認済み）
 """
 from __future__ import annotations
@@ -82,7 +83,17 @@ S5_SL          = 80
 S5_MAX_HOLD    = 6
 
 # ==========================================================================
-# DD管理（全系統合算 ①③④⑤）
+# 系統⑥ : 前日終値乖離逆張り
+# ==========================================================================
+S6_THRESH   = 250
+S6_HOURS    = frozenset({3, 4, 9, 10, 14, 15, 16, 18, 22, 23})
+S6_CD_MIN   = 90        # クールダウン（分）= 18本 × 5分
+S6_TP       = 200
+S6_SL       = 80
+S6_MAX_HOLD = 6
+
+# ==========================================================================
+# DD管理（全系統合算 ①③④⑤⑥）
 # ==========================================================================
 DD_LIMIT_YEN = -300_000   # 月次DD上限（円）= auto_trade.py ALL_DD_LIMIT_YEN と同値
 
@@ -346,3 +357,53 @@ def check_s5(df: pd.DataFrame, cpi_df: pd.DataFrame) -> bool:
     move_pct = (cur["close"] - prev["close"]) / prev["close"]
     return move_pct >= S5_MOVE_PCT and cur["rsi14"] >= S5_RSI_TH
 
+
+# ==========================================================================
+# 系統⑥ シグナル判定
+# ==========================================================================
+def check_s6(
+    df: pd.DataFrame,
+    cpi_df: pd.DataFrame,
+    last_signal_time: Optional[datetime] = None,
+) -> Optional[str]:
+    """系統⑥（前日終値乖離逆張り）シグナル判定。
+
+    戻り値: "long" / "short" / None
+
+    クールダウン管理は caller が last_signal_time を渡し、
+    発火時に last_signal_time = now を更新すること。
+    """
+    if df is None or len(df) < 5:
+        return None
+
+    cur = df.iloc[-1]
+    dt  = pd.to_datetime(cur["datetime"])
+
+    if dt.hour not in S6_HOURS:
+        return None
+
+    if is_cpi_window(dt.to_pydatetime(), cpi_df):
+        return None
+
+    def _tday(ts: pd.Timestamp):
+        return (ts - pd.Timedelta(days=1)).date() if ts.hour < 17 else ts.date()
+
+    cur_tday  = _tday(dt)
+    dts       = pd.to_datetime(df["datetime"])
+    prev_mask = dts.apply(_tday) < cur_tday
+    if not prev_mask.any():
+        return None
+    prev_close = float(df[prev_mask].iloc[-1]["close"])
+
+    dev = float(cur["close"]) - prev_close
+    if abs(dev) < S6_THRESH:
+        return None
+
+    side = "short" if dev >= S6_THRESH else "long"
+
+    if last_signal_time is not None:
+        elapsed = (dt.to_pydatetime() - last_signal_time).total_seconds()
+        if elapsed < S6_CD_MIN * 60:
+            return None
+
+    return side
