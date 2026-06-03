@@ -634,5 +634,8 @@ if __name__ == "__main__":
             sys.stdout = f
             main()
         sys.stdout = sys.__stdout__
-        import subprocess
-        subprocess.Popen(["code", "bt_result45.txt"])
+        try:
+            import subprocess
+            subprocess.Popen(["code", "bt_result45.txt"])
+        except FileNotFoundError:
+            pass
