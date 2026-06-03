@@ -466,5 +466,70 @@ TP: ブローカー指値注文のまま → 約定価格通りに刺さる
 
 | 判断 | 決定 |
 |---|---|
-| J2: state.json 廃止 | ✅ Yes |
-| J1: TP/SL 方式 | ✅ B: ハイブリッド（SL=ソフトウェア成行 / TP=ブローカー指値） |
+| J2: state.json 廃止 | ✅ 実装済み |
+| J1: TP/SL 方式 | ✅ 実装済み（B: ハイブリッド） |
+
+---
+
+### 次期設計方向（J3: 責任分界の整理）
+
+#### 現状の問題
+
+J1・J2 実装後も以下の設計上の曖昧さが残っている。
+
+**状態の正（Source of Truth）が分散：**
+
+| 状態 | 現在の所在 | 問題 |
+|---|---|---|
+| ポジション実在 | ブローカー /positions | ✅ J2で整理済み |
+| system/sl_price/tp_price | open_positions.json（補助） | 起動間のみ必要 |
+| TP注文ID | open_positions.json | 再起動後に古い値が残ることがある |
+| 月次損益 | zh_monitor + CSV | どちらが正か不明確 |
+
+**責任分界が曖昧：**
+- `zh_entry._close_opposite()` が zh_monitor の内部状態（pnl/trade_log/positions）を直接書き換えている
+- 同じ決済後処理ロジックが `_monitor_inner` と `_close_opposite` の2箇所に分散
+
+#### 設計案（カブコム API 照合済み・実装前）
+
+**J3-A: zh_monitor を「ポジション管理の唯一の窓口」にする**
+
+```
+zh_monitor が公開する API:
+
+  startup_restore()
+    = restore_from_broker() + replace_close_orders() を統合
+    = 起動時に1回呼ぶだけで「ポジション復元 + TP再発注」が完結
+    → カブコム API: /positions(GET) + /sendorder/future(POST, FrontOrderType=20)
+
+  add_position(pos)
+    = positions.append + save_positions のラッパー
+    → API呼び出しなし
+
+  close_position(pos, exit_price, reason, now)
+    = PnL計算・trade_log・CSV・DD判定・positions削除・save を一括
+    = _monitor_inner と _close_opposite に分散しているロジックを統合
+    → API呼び出しなし（決済注文は呼び出し元が担当）
+```
+
+**ZAIHOU.py 起動部分の変化（イメージ）:**
+
+```python
+# 現在（起動後に3回呼ぶ）:
+zh_monitor.restore_from_broker()
+zh_monitor.replace_close_orders(_se)
+
+# J3-A後（1回で済む）:
+zh_monitor.startup_restore()
+```
+
+**変更範囲（API違反なし・確認済み）:**
+
+| ファイル | 変更量 | 内容 |
+|---|---|---|
+| zh_monitor.py | 中 | startup_restore/add_position/close_position を追加 |
+| zh_entry.py | 中 | _close_opposite が大幅に短くなる（約60行→15行） |
+| ZAIHOU.py | 小 | 起動シーケンス数行の変更 |
+| zh_order/bar/api/utils/config | **変更なし** | |
+
+**実装の優先度:** J3-A → J3-B（⑦翌限月削除）→ J3-C（⑧シークレット管理）の順を推奨
