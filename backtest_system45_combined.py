@@ -75,11 +75,10 @@ S5_EXCL_MONTHS: tuple = (1, 7)
 # 取引日順ソートキー: 17:00以上=その日が取引日、17:00未満=前日が取引日
 # (取引日, datetime) タプルで返すことで夜間後半(翌0時〜)と翌夜間(17時〜)の混在を防ぐ
 def _trading_day_sort_key(dt):
+    """取引日順ソートキー: bt13/ZAIHOU_signals と同一（夜間17:xx→深夜→翌朝日中）"""
     if dt.hour < 17:
-        trading_date = (dt - pd.Timedelta(days=1)).date()
-    else:
-        trading_date = dt.date()
-    return (pd.Timestamp(trading_date), dt)
+        return dt + pd.Timedelta(days=1)
+    return dt
 
 
 # DST期間
@@ -124,10 +123,8 @@ def load_data() -> pd.DataFrame:
     if not dfs:
         raise FileNotFoundError("データファイルが見つかりません")
     df = pd.concat(dfs, ignore_index=True).drop_duplicates(subset=["datetime"]).copy()
-    df["_tday"] = df["datetime"].apply(
-        lambda dt: (dt - pd.Timedelta(days=1)).date() if dt.hour < 17 else dt.date()
-    )
-    df = df.sort_values(["_tday", "datetime"]).drop(columns=["_tday"]).reset_index(drop=True)
+    sort_keys = df["datetime"].map(_trading_day_sort_key)
+    df = df.iloc[sort_keys.argsort(kind="stable")].reset_index(drop=True)
     print(f"合計: {len(df)} 本  ({df['datetime'].min()} ~ {df['datetime'].max()})\n")
     return df
 
