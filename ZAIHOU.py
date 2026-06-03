@@ -19,12 +19,12 @@ import zh_entry
 from zh_config import (
     DERIV_MONTH, NEXT_DERIV_MONTH,
     DRY_RUN, DD_LIMIT_YEN,
-    POLL_SEC, RECONCILE_INTERVAL,
+    POLL_SEC,
     MAX_AUTH_ERRORS,
     JST,
 )
 from zh_utils import (
-    send_discord, log, safe_json,
+    send_discord, log,
     is_holiday, _sess_exchange, _board_price,
 )
 
@@ -71,13 +71,14 @@ def main():
     print(f"TP: ①{sig.S1_TP} ③{sig.S3_TP} ④{sig.S4_TP} ⑤{sig.S5_TP}")
     print("=" * 60)
 
-    # ── 初期化 ──
+    # ── 初期化（APIなしでできるもの）──
     zh_entry.cpi_df = sig.load_cpi_events()
-    zh_monitor.load_positions()
-    if zh_monitor.positions:
-        log(f"[RESUME] 保有ポジション復元: {len(zh_monitor.positions)}件")
-        for p in zh_monitor.positions:
-            log(f"  系統{p['system']} {p['side']} @ {p['entry_price']}")
+    if DRY_RUN:
+        zh_monitor.load_positions()  # DRY_RUN: JSONからそのまま読み込む
+        if zh_monitor.positions:
+            log(f"[RESUME] 保有ポジション復元(DRY): {len(zh_monitor.positions)}件")
+            for p in zh_monitor.positions:
+                log(f"  系統{p['system']} {p['side']} @ {p['entry_price']}")
     zh_monitor.restore_monthly_pnl()
     zh_bar.can_trade = zh_bar.load_warmup()
     if not zh_bar.can_trade:
@@ -96,34 +97,11 @@ def main():
     zh_bar._price_tick_callback = zh_monitor._ws_check_sl_tp
     zh_bar.start_ws()
 
-    # ── 起動時ポジション整合（REPLACE前）──
-    if zh_monitor.positions and not DRY_RUN and zh_api.SYMBOL:
-        res_pos = zh_api.request_with_reauth(
-            "GET", f"/positions?product=3&symbol={zh_api.SYMBOL}&addinfo=false")
-        if res_pos is not None:
-            pos_data = safe_json(res_pos)
-            if isinstance(pos_data, list):
-                live_ids = {
-                    str(p.get("ExecutionID"))
-                    for p in pos_data if float(p.get("LeavesQty", 0)) > 0
-                }
-                with zh_monitor._positions_lock:
-                    surviving = []
-                    for p in zh_monitor.positions:
-                        hid = p.get("hold_id")
-                        if hid and hid not in live_ids:
-                            msg = (f"⚠️ 系統{p['system']} 起動時消滅検知"
-                                   f"(停止中に約定済みの可能性) HoldID:{hid}")
-                            log(f"[RESUME] {msg}"); send_discord(msg)
-                        else:
-                            surviving.append(p)  # hold_idなし または 生存確認
-                    if len(surviving) < len(zh_monitor.positions):
-                        zh_monitor.positions[:] = surviving
-                        zh_monitor.save_positions()
-            else:
-                log("[WARN] 起動時 /positions異常レスポンス → ファイル内容をそのまま使用")
-        else:
-            log("[WARN] 起動時 /positions照会失敗 → ファイル内容をそのまま使用")
+    # ── 起動時ポジション復元（本番モードのみ、ブローカーAPIを正とする）──
+    if not DRY_RUN:
+        zh_monitor.restore_from_broker()
+        if zh_monitor.positions:
+            log(f"[RESUME] 保有ポジション復元: {len(zh_monitor.positions)}件")
 
     # ── 起動時 SL/TP 再発注（保有ポジションがある場合）──
     if zh_monitor.positions and not DRY_RUN:
@@ -137,7 +115,6 @@ def main():
     last_sl_replace_hhmm = -1   # 16:45 / 800 の重複防止
     last_pos_report_hhmm = -1
     last_hourly_h        = -1
-    last_reconcile_time  = None
     last_verbose_min     = -1
     last_heartbeat_h     = -1
 
@@ -219,13 +196,6 @@ def main():
                     if lines:
                         send_discord("⏱ 保有中\n" + "\n".join(lines))
                     last_hourly_h = now.hour
-
-        # ── ブローカー整合チェック (60秒ごと) ──
-        if not DRY_RUN and zh_monitor.positions:
-            if (last_reconcile_time is None
-                    or (now - last_reconcile_time).total_seconds() >= RECONCILE_INTERVAL):
-                zh_monitor.reconcile_positions(now)
-                last_reconcile_time = now
 
         if verbose:
             log(f"[TICK] hhmm={hhmm} ポジション:{len(zh_monitor.positions)}件"

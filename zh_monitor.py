@@ -58,6 +58,7 @@ def save_positions() -> None:
         json.dump(positions, f, ensure_ascii=False, default=str)
 
 def load_positions() -> None:
+    """DRY_RUNモード用: JSONからポジションを読み込む"""
     global positions
     if not OPEN_POS_FILE.exists():
         return
@@ -67,6 +68,73 @@ def load_positions() -> None:
         if isinstance(p.get("entry_time"), str):
             p["entry_time"] = datetime.fromisoformat(p["entry_time"])
     positions = data
+
+def restore_from_broker() -> None:
+    """本番モード用: ブローカーAPIを正としてポジションを復元する（J2）
+    コンテキストファイル（open_positions.json）を補助情報として使用。
+    ブローカーにない = 停止中に約定済みとして破棄。hold_idなし = 除外。
+    """
+    global positions
+
+    # コンテキストファイルを読み込む（hold_id をキーに）
+    context_map: dict = {}
+    if OPEN_POS_FILE.exists():
+        try:
+            with open(OPEN_POS_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            for p in data:
+                if isinstance(p.get("entry_time"), str):
+                    p["entry_time"] = datetime.fromisoformat(p["entry_time"])
+                hid = p.get("hold_id")
+                if hid:
+                    context_map[hid] = p
+        except Exception as e:
+            log(f"[WARN] コンテキストファイル読み込み失敗: {e}")
+
+    # ブローカーからポジション取得
+    res = zh_api.request_with_reauth(
+        "GET", f"/positions?product=3&symbol={zh_api.SYMBOL}&addinfo=false")
+    if res is None:
+        log("[WARN] restore_from_broker: /positions照会失敗 → コンテキストのみで復元")
+        positions = list(context_map.values())
+        return
+    pos_data = safe_json(res)
+    if not isinstance(pos_data, list):
+        log("[WARN] restore_from_broker: /positions異常レスポンス → コンテキストのみで復元")
+        positions = list(context_map.values())
+        return
+
+    # ブローカー建玉と照合して復元
+    broker_hids = {
+        str(p.get("ExecutionID"))
+        for p in pos_data if float(p.get("LeavesQty", 0)) > 0
+    }
+    recovered = []
+    for bp in pos_data:
+        if float(bp.get("LeavesQty", 0)) <= 0:
+            continue
+        hid = str(bp.get("ExecutionID", ""))
+        if hid in context_map:
+            pos = context_map[hid].copy()
+            pos["entry_price"] = float(bp.get("Price", pos.get("entry_price", 0)))
+            recovered.append(pos)
+            log(f"[RESUME] 系統{pos['system']} {pos['side']} @ {pos['entry_price']}  HoldID:{hid}")
+        else:
+            side = "short" if str(bp.get("Side", "")) == "1" else "long"
+            msg = (f"⚠️ 不明ポジション(コンテキストなし) "
+                   f"HoldID:{hid} Side:{side} Price:{bp.get('Price')} → 監視不可・手動確認要")
+            log(f"[RESUME] {msg}"); send_discord(msg)
+
+    # コンテキストにあってブローカーにない → 停止中に約定済み
+    for hid, ctx in context_map.items():
+        if hid not in broker_hids:
+            msg = (f"⚠️ 系統{ctx.get('system','?')} 起動時消滅検知"
+                   f"(停止中に約定済みの可能性) HoldID:{hid}")
+            log(f"[RESUME] {msg}"); send_discord(msg)
+
+    positions = recovered
+    save_positions()
+    log(f"[RESUME] ブローカーから{len(positions)}件復元")
 
 def restore_monthly_pnl() -> None:
     global monthly_pnl_yen, monthly_stopped, monthly_ym
@@ -357,56 +425,6 @@ def replace_close_orders(session_exchange: int) -> None:
                 f"  TP:{pos['tp_price']:.0f}(OrderId:{new_tp})")
         save_positions()
 
-def reconcile_positions(now: datetime) -> None:
-    """ブローカーポジション整合チェック（本番モードのみ）"""
-    if DRY_RUN or not zh_api.SYMBOL:
-        return
-    with _positions_lock:
-        if not positions:
-            return
-        internal_net   = sum(1 if p["side"] == "long" else -1 for p in positions)
-        internal_gross = len(positions)
-
-    res = zh_api.request_with_reauth("GET", f"/positions?product=3&symbol={zh_api.SYMBOL}&addinfo=false")
-    if not res:
-        log("[RECONCILE] /positions照会失敗 → スキップ")
-        return
-    data = safe_json(res)
-    if not isinstance(data, list):
-        return
-    actual_net   = 0
-    actual_gross = 0
-    for p in data:
-        qty          = int(p.get("LeavesQty", 0))
-        actual_gross += qty
-        actual_net   += qty if str(p.get("Side", "")) == "2" else -qty
-
-    if actual_net == internal_net and actual_gross == internal_gross:
-        return
-
-    msg = (f"⚠️ポジション不一致 "
-           f"内部:net{internal_net:+d}/{internal_gross}件 "
-           f"ブローカー:net{actual_net:+d}/gross{actual_gross}枚")
-    log(f"[RECONCILE] {msg}"); send_discord(msg)
-
-    hhmm  = now.hour * 100 + now.minute
-    _sess = _sess_exchange(hhmm)
-
-    if actual_gross == 0:
-        with _positions_lock:
-            for pos in list(positions):
-                if pos.get("tp_order_id"):
-                    zh_order.cancel_order(pos["tp_order_id"])
-            positions.clear()
-        save_positions()
-        send_discord("⚠️TP見逃し検知 → TP注文キャンセル・内部クリア(ブローカー既約定)")
-    elif actual_net * internal_net < 0:
-        close_side = "buy" if actual_net < 0 else "sell"
-        oid = zh_order.send_entry_order(close_side, _sess, trade_type=2)
-        if oid:
-            send_discord(f"🚨逆ポジ緊急フラット → 成行 OrderId:{oid}")
-        else:
-            send_discord("🚨最緊急 逆ポジフラット失敗 手動決済要")
 
 # ==========================================================================
 # ポジション報告
