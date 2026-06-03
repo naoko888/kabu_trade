@@ -186,7 +186,7 @@ def _add_entry_info(trades: pd.DataFrame, price_df: pd.DataFrame) -> pd.DataFram
     t = trades.copy()
     t["entry_time"]  = t["signal_dt"] + pd.Timedelta(minutes=5)
     t["entry_price"] = t["entry_time"].map(dt_open)
-    t["trade_date"]  = t["entry_time"].apply(get_trade_date)
+    t["trade_date"]  = pd.to_datetime(t["signal_dt"]).dt.date  # signal_dt は調整済みなので date() のみ
     return _add_side(t)
 
 
@@ -276,9 +276,9 @@ def print_bt_verification(bt_xlsx: pd.DataFrame):
 
 # ===== セクション3: シグナル一致判定 =====
 def _make_match_key(df: pd.DataFrame) -> pd.DataFrame:
-    """物理 entry_time をそのままキーにする（BT・実運用とも同一物理時刻）"""
+    """trade_date をキーにする（live/BT とも取引日付で統一）"""
     df = df.copy()
-    date_str = df["entry_time"].dt.strftime("%Y-%m-%d")
+    date_str = df["trade_date"].astype(str)
     hm       = df["entry_time"].dt.floor("5min").dt.strftime("%H:%M")
     df["_key"] = date_str + "|" + df["system"].astype(str) + "|" + df["side"].astype(str) + "|" + hm
     return df
@@ -389,14 +389,14 @@ def print_signal_match_section(live_df: pd.DataFrame, bt_xlsx: pd.DataFrame, bt_
     if live_df.empty or "entry_time" not in live_df.columns:
         print("  実運用ログなし")
         return
-    today     = pd.Timestamp.now().date()
-    all_dates = set(live_df["entry_time"].dt.date.unique())
+    today     = get_trade_date(pd.Timestamp.now())
+    all_dates = set(live_df["trade_date"].unique())
     recent    = sorted([d for d in all_dates if d <= today], reverse=True)[:days]
 
     for day in recent:
-        live_d = live_df[live_df["entry_time"].dt.date == day].copy()
-        xlsx_d = bt_xlsx[bt_xlsx["entry_time"].dt.date == day].copy() if not bt_xlsx.empty else pd.DataFrame()
-        csv_d  = bt_csv[bt_csv["entry_time"].dt.date  == day].copy() if not bt_csv.empty  else pd.DataFrame()
+        live_d = live_df[live_df["trade_date"] == day].copy()
+        xlsx_d = bt_xlsx[bt_xlsx["trade_date"] == day].copy() if not bt_xlsx.empty else pd.DataFrame()
+        csv_d  = bt_csv[bt_csv["trade_date"]  == day].copy() if not bt_csv.empty  else pd.DataFrame()
         _print_day_match(day, live_d, xlsx_d, "Excelデータ BT")
         _print_day_match(day, live_d, csv_d,  "CSV BT")
 
@@ -502,11 +502,12 @@ def main():
     bt_xlsx = run_bt(raw_xlsx_bt13, raw_xlsx_bt45, cpi_df, label="XLSX")
     bt_csv  = run_bt(raw_csv_bt13,  raw_csv_bt45,  cpi_df, label="CSV")
 
-    # BT も now 以降の未来シグナルを除外
+    # BT の未来シグナルを除外（trade_date で比較。entry_time は調整済みで物理時刻と異なる場合あり）
+    today_td = get_trade_date(now)
     if not bt_xlsx.empty:
-        bt_xlsx = bt_xlsx[bt_xlsx["entry_time"] <= now].copy()
+        bt_xlsx = bt_xlsx[bt_xlsx["trade_date"] <= today_td].copy()
     if not bt_csv.empty:
-        bt_csv = bt_csv[bt_csv["entry_time"] <= now].copy()
+        bt_csv = bt_csv[bt_csv["trade_date"] <= today_td].copy()
 
     # セクション1: BT検証
     print_bt_verification(bt_xlsx)
