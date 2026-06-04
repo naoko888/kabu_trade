@@ -255,12 +255,17 @@ def _monitor_inner(now: datetime, hhmm: int, board) -> None:
                     pnl = (cp - pos["entry_price"]) if side == "long" else (pos["entry_price"] - cp)
                     log(f"[LIVE] 系統{system} TP約定確認(ポジション消滅):{cp:.0f}")
                 elif reason == "SL到達":
-                    # ソフトウェアSL: TP が HoldID を拘束しているため先にキャンセル
+                    # ソフトウェアSL: TP キャンセル → HoldQty==0 確認 → ClosePositions
                     tp_oid = pos.get("tp_order_id")
                     if tp_oid:
                         zh_order.cancel_order(tp_oid)
-                        time.sleep(0.3)
                     hid = pos.get("hold_id")
+                    if tp_oid and hid:
+                        released = _wait_for_hold_release(hid)
+                        if not released:
+                            send_discord(f"🚨最緊急 系統{system} SL HoldID解放タイムアウト 手動決済要")
+                            still_open.append(pos)
+                            continue
                     if hid:
                         _body = {
                             "Password": API_PASSWORD, "Symbol": zh_api.SYMBOL,
@@ -274,6 +279,7 @@ def _monitor_inner(now: datetime, hhmm: int, board) -> None:
                         res_cl = zh_api.request_with_reauth("POST", "/sendorder/future", json_body=_body)
                         rj = safe_json(res_cl) if res_cl else {}
                         close_oid = rj.get("OrderId") if rj.get("Result") == 0 else None
+                        log(f"[SL_POLL] ClosePositions結果 Result:{rj.get('Result')} OrderId:{close_oid}")
                     else:
                         close_oid = zh_order.send_entry_order(close_side, _sess, trade_type=2)
                     if close_oid and close_oid != "DRY":
@@ -370,6 +376,36 @@ def _monitor_inner(now: datetime, hhmm: int, board) -> None:
 
     positions = still_open
     save_positions()
+
+# ==========================================================================
+# HoldID 拘束解放待ち（SL決済前に使用）
+# ==========================================================================
+def _wait_for_hold_release(hid: str, max_retries: int = 10, interval: float = 0.3) -> bool:
+    """TP キャンセル後、HoldQty==0（HoldID解放）をポーリングで確認する。
+    解放確認できれば True、タイムアウトは False。
+    ※HoldQty==0 後に ClosePositions が必ず成功するかは実機検証中。"""
+    for attempt in range(1, max_retries + 1):
+        time.sleep(interval)
+        res = zh_api.request_with_reauth(
+            "GET", f"/positions?product=3&symbol={zh_api.SYMBOL}&addinfo=false"
+        )
+        if res is None:
+            continue
+        pd_ = safe_json(res)
+        if not isinstance(pd_, list):
+            continue
+        tgt = next((p for p in pd_ if str(p.get("ExecutionID")) == hid), None)
+        if tgt is None:
+            log(f"[SL_POLL] HoldID:{hid} ポジション消滅 attempt={attempt}")
+            return False  # TP約定済みの可能性 → ClosePositions不要
+        hold = float(tgt.get("HoldQty", 1))
+        log(f"[SL_POLL] HoldID:{hid} HoldQty={hold} attempt={attempt}")
+        if hold == 0:
+            log(f"[SL_POLL] HoldQty==0 確認 → ClosePositions送信へ")
+            return True
+    log(f"[SL_POLL] タイムアウト HoldID:{hid} ({max_retries}回)")
+    return False
+
 
 # ==========================================================================
 # 緊急フラット
