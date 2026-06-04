@@ -227,7 +227,9 @@ SL・TP のキャンセルに失敗した場合に実行する最終手段。
 | Bug3 | 再起動時 SL 再発注 | HoldID が無効で SL 全滅 | ✅ 解決（SL をソフトウェア監視に変更） |
 | Bug4 | 再起動後 | state.json のゴーストポジションを復元 | ✅ 解決（restore_from_broker() でブローカーを正とする） |
 | Bug5 | 認証エラー連続 | 5 回で安全終了（指数バックオフなし） | ⏸ 未着手 |
-| Bug6 | SL 到達時 | TP 注文がアクティブなまま同一 HoldID に ClosePositions を送ると Code:8 "決済指定内容に誤りがあります" で失敗し、0.4 秒ごとに無限リトライ | ✅ 解決（TP キャンセル後に `/positions` で HoldQty==0 を確認してから ClosePositions 発注。`_wait_for_hold_release()` 参照。zh_monitor.py 2026-06-04） |
+| Bug6 | SL 到達時 | TP 注文がアクティブなまま同一 HoldID に ClosePositions を送ると Code:8 で失敗し無限リトライ | ✅ 解決（`_wait_for_hold_release()` で HoldQty==0 確認後に発注。2026-06-04） |
+| Bug7 | 強制決済（TIME/セッション終了） | FIFO（ClosePositionOrder=0）使用のため複数ポジション保有時に意図しない建玉を閉じる可能性がある。①④が冬時間23時に同時 long エントリーするケースが実在（月火水） | ⏸ 未着手（HoldID 指定決済に変更が必要） |
+| Bug8 | 強制決済の HoldQty 解放 | SL パスと異なり強制決済パスは `_wait_for_hold_release()` 未適用。TP キャンセル後 0.5 秒固定待機のため HoldQty 未解放で FIFO が失敗する可能性あり | ⏸ 未着手 |
 
 ---
 
