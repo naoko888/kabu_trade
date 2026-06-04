@@ -227,7 +227,7 @@ SL・TP のキャンセルに失敗した場合に実行する最終手段。
 | Bug3 | 再起動時 SL 再発注 | HoldID が無効で SL 全滅 | ✅ 解決（SL をソフトウェア監視に変更） |
 | Bug4 | 再起動後 | state.json のゴーストポジションを復元 | ✅ 解決（restore_from_broker() でブローカーを正とする） |
 | Bug5 | 認証エラー連続 | 5 回で安全終了（指数バックオフなし） | ⏸ 未着手 |
-| Bug6 | SL 到達時 | TP 注文がアクティブなまま同一 HoldID に ClosePositions を送ると Code:8 "決済指定内容に誤りがあります" で失敗し、0.4 秒ごとに無限リトライ | ✅ 解決（SL 到達時に TP を先にキャンセルしてから ClosePositions 発注。zh_monitor.py 2026-06-04） |
+| Bug6 | SL 到達時 | TP 注文がアクティブなまま同一 HoldID に ClosePositions を送ると Code:8 "決済指定内容に誤りがあります" で失敗し、0.4 秒ごとに無限リトライ | ✅ 解決（TP キャンセル後に `/positions` で HoldQty==0 を確認してから ClosePositions 発注。`_wait_for_hold_release()` 参照。zh_monitor.py 2026-06-04） |
 
 ---
 
@@ -286,6 +286,7 @@ ZAIHOU.py は `main()` のみ（起動・ループ制御）。リファクタリ
 - **_bar_state_lock を新設した理由**: WebSocket スレッドとメインループ間で `_bar_state` を保護するため。`_positions_lock`（positions 保護用）とは別ロックにすることでロック競合を避ける。
 - **global 宣言に注意**: Python の `global` は dotted name（`zh_bar.foo` 等）を受け付けない。replace_all で変数名を置換する際は事前に `global` 宣言行を確認して手動修正する。
 - **zh_monitor.py が ZAIHOU_signals に依存する理由**: `_SL_MAP` / `_TP_MAP` / `_MH_MAP` の参照のため。Phase 7 以降で zh_entry.py が持つべき情報だが、現時点では zh_monitor.py が保有（設計懸念 D1）。
+- **`_wait_for_hold_release(hid, max_retries=10, interval=0.3)` の役割**: SL 到達時に TP キャンセル後の HoldID 解放を確認するヘルパー関数（zh_monitor.py）。`/positions` の `HoldQty==0` を最大 10 回ポーリング（最大 3 秒）。解放確認後に ClosePositions を送ることで Bug6（Code:8 無限リトライ）を根本解消。「HoldQty==0 なら ClosePositions が必ず成功する」は実機検証中（`[SL_POLL]` ログで確認予定）。J3-A 実装時はこの関数ごと移植する。
 - **`_adjust_trading_day` による曜日判定の動作**: バーの datetime は `_adjust_trading_day` で補正済み（17:00以降 → 翌取引日付）。シグナル判定の曜日・時刻フィルターはこの補正後 datetime を使用するため、**夜間バーの weekday は物理日ではなく翌取引日の weekday** になる。例: 2026-06-02（火）17:00 のバーは 2026-06-03（水）17:00 として扱われ、③ の S3_WEEKDAYS 判定が水曜（wd=2）で行われる。これは設計通りの動作（trading day convention）。BT 側のパフォーマンス比較スクリプトがこの変換を考慮していなかったため、2026-06-03 に `micro_performance_summary.py` の照合キーを trade_date ベースに修正した。
 
 ---
@@ -404,7 +405,7 @@ ZAIHOU.py は `main()` のみ（起動・ループ制御）。リファクタリ
 |---|---|
 | J2（ポジションあり再起動） | DRY_RUN=True で誤再起動したため未検証 |
 | TP 到達 | `/positions` 消滅確認ロジック未実施 |
-| SL 到達 | ✅ 実機確認（2026-06-04）。ただし Bug6 が発覚・修正済み（詳細は 14 章） |
+| SL 到達 | ✅ 実機確認（2026-06-04）。Bug6 発覚→根本対処済み。次回実弾で `[SL_POLL]` ログにより HoldQty==0 後の ClosePositions 成否を検証予定 |
 
 ---
 
