@@ -255,7 +255,11 @@ def _monitor_inner(now: datetime, hhmm: int, board) -> None:
                     pnl = (cp - pos["entry_price"]) if side == "long" else (pos["entry_price"] - cp)
                     log(f"[LIVE] 系統{system} TP約定確認(ポジション消滅):{cp:.0f}")
                 elif reason == "SL到達":
-                    # ソフトウェアSL: HoldID指定または成行で直接決済
+                    # ソフトウェアSL: TP が HoldID を拘束しているため先にキャンセル
+                    tp_oid = pos.get("tp_order_id")
+                    if tp_oid:
+                        zh_order.cancel_order(tp_oid)
+                        time.sleep(0.3)
                     hid = pos.get("hold_id")
                     if hid:
                         _body = {
@@ -286,10 +290,7 @@ def _monitor_inner(now: datetime, hhmm: int, board) -> None:
                         send_discord(f"🚨最緊急 系統{system} SL決済失敗 手動決済要")
                         still_open.append(pos)
                         continue
-                    # TP注文をキャンセル（SL決済済みのため）
-                    tp_oid = pos.get("tp_order_id")
-                    if tp_oid:
-                        zh_order.cancel_order(tp_oid)
+                    # TP は上記で cancel 実施済み
                 else:
                     # 強制決済: TPキャンセル確認 → 成行
                     tp_ok = zh_order.cancel_order(pos["tp_order_id"]) if pos.get("tp_order_id") else True
