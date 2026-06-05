@@ -243,6 +243,11 @@ def check_entry(now: datetime, board: dict) -> None:
         last_signal_bar_time = latest_bar_time
         log("[SKIP] friday_night_entry_block")
         return
+    # 暫定措置: Bug8検証期間中の安全対策（解除時はこの2行を削除）
+    if 1530 <= hhmm_now < 1700:
+        log("[SKIP] temp_day_entry_block(15:30-)"); return
+    if 540 <= hhmm_now < 845:
+        log("[SKIP] temp_night_entry_block(5:40-)"); return
 
     bar_age_min = (now_naive - bar_dt).total_seconds() / 60
     if bar_age_min > 10:

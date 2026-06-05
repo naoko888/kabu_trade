@@ -199,7 +199,7 @@ def _monitor_inner(now: datetime, hhmm: int, board) -> None:
 
         # ── セッション終了強制決済 ──
         if reason is None:
-            _gap = (1540 <= hhmm < 1700) or (555 <= hhmm < 845)
+            _gap = (1530 <= hhmm < 1700) or (540 <= hhmm < 845)  # 暫定: 15:30/5:40強制決済
             gap_trigger = _gap
             if gap_trigger:
                 if pos.get("_gap_triggered") is None:
@@ -226,7 +226,7 @@ def _monitor_inner(now: datetime, hhmm: int, board) -> None:
                 _sess      = _sess_exchange(hhmm)
                 close_side = "buy" if side == "short" else "sell"
                 if reason == "セッション終了強制決済":
-                    _sess = 23 if (1540 <= hhmm < 1700) else 24
+                    _sess = 23 if (1530 <= hhmm < 1700) else 24  # 暫定: 15:30基準
 
                 if reason == "TP到達":
                     # GET /positions でポジションが消えているか確認
