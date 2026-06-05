@@ -298,19 +298,24 @@ def _monitor_inner(now: datetime, hhmm: int, board) -> None:
                         continue
                     # TP は上記で cancel 実施済み
                 else:
-                    # 強制決済: TPキャンセル確認 → 成行
+                    # 強制決済: TPキャンセル → HoldQty解放確認 → HoldID名指し決済（SLと同方式）
                     tp_ok = zh_order.cancel_order(pos["tp_order_id"]) if pos.get("tp_order_id") else True
-                    time.sleep(0.5)
                     if not tp_ok:
                         _emergency_flat(system, _sess)
                         still_open.append(pos)
                         continue
-                    # ポジション存在確認（キャンセル直前にSL/TPが約定済みの可能性を排除）
+                    hid = pos.get("hold_id")
+                    if pos.get("tp_order_id") and hid:
+                        if not _wait_for_hold_release(hid):
+                            msg = f"🚨最緊急 系統{system} 強制決済 HoldID解放タイムアウト 手動決済要"
+                            log(f"[ALERT] {msg}"); send_discord(msg)
+                            still_open.append(pos)
+                            continue
+                    # ポジション存在確認（SL/TPが先に約定済みの可能性を排除）
                     res_pos = zh_api.request_with_reauth("GET", f"/positions?product=3&symbol={zh_api.SYMBOL}&addinfo=false")
                     if res_pos is not None:
                         pos_data = safe_json(res_pos)
                         if isinstance(pos_data, list):
-                            hid = pos.get("hold_id")
                             if hid:
                                 still_exists = any(
                                     str(p.get("ExecutionID")) == hid and float(p.get("LeavesQty", 0)) > 0
@@ -326,7 +331,22 @@ def _monitor_inner(now: datetime, hhmm: int, board) -> None:
                                 msg = f"⚠️ 系統{system} 強制決済スキップ(ポジションなし SL/TP約定済みの可能性)"
                                 log(f"[WARN] {msg}"); send_discord(msg)
                                 continue
-                    close_oid = zh_order.send_entry_order(close_side, _sess, trade_type=2)
+                    if hid:
+                        _body = {
+                            "Password": API_PASSWORD, "Symbol": zh_api.SYMBOL,
+                            "Exchange": _sess,
+                            "TradeType": 2, "TimeInForce": 2,
+                            "Side": "1" if close_side == "sell" else "2",
+                            "Qty": LOT, "Price": 0, "ExpireDay": 0,
+                            "FrontOrderType": 120,
+                            "ClosePositions": [{"HoldID": hid, "Qty": LOT}],
+                        }
+                        res_cl = zh_api.request_with_reauth("POST", "/sendorder/future", json_body=_body)
+                        rj = safe_json(res_cl) if res_cl else {}
+                        close_oid = rj.get("OrderId") if rj.get("Result") == 0 else None
+                        log(f"[FORCE] ClosePositions Result:{rj.get('Result')} OrderId:{close_oid}")
+                    else:
+                        close_oid = zh_order.send_entry_order(close_side, _sess, trade_type=2)
                     if close_oid and close_oid != "DRY":
                         fill = zh_order.wait_for_fill(close_oid)
                         if fill is None:
