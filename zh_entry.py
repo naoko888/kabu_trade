@@ -15,6 +15,7 @@ from zh_config import (
     DRY_RUN,
     PT_TO_YEN, COMMISSION_YEN,
     DD_LIMIT_YEN, LOG_DIR,
+    ENABLE_S4, ENABLE_S5,
 )
 from zh_utils import log, send_discord, _sess_exchange, _board_price
 
@@ -292,7 +293,7 @@ def check_entry(now: datetime, board: dict) -> None:
         _enter_position(system, side, cp, board, now, sess_ex)
 
     # ── 系統④ ──
-    if not zh_monitor.monthly_stopped and sig.check_s4(df_confirmed):
+    if ENABLE_S4 and not zh_monitor.monthly_stopped and sig.check_s4(df_confirmed):
         if s4_last_bar != latest_bar_time:
             s4_last_bar = latest_bar_time
             _close_opposite("④", "long", now, board)
@@ -301,7 +302,7 @@ def check_entry(now: datetime, board: dict) -> None:
         log(f"[系統④] 月次DD停止中 ({zh_monitor.monthly_pnl_yen:,.0f}円)")
 
     # ── 系統⑤ ──
-    if not zh_monitor.monthly_stopped and sig.check_s5(df_confirmed, cpi_df):
+    if ENABLE_S5 and not zh_monitor.monthly_stopped and sig.check_s5(df_confirmed, cpi_df):
         if s5_last_bar != latest_bar_time:
             s5_last_bar = latest_bar_time
             _close_opposite("⑤", "short", now, board)

@@ -23,8 +23,11 @@ DERIV_MONTH      = "202606"
 NEXT_DERIV_MONTH = "202609"
 LOT              = 1
 
-DRY_RUN      = False   # True=シミュレーション / False=本番発注
+DRY_RUN      = True   # True=シミュレーション / False=本番発注
 DD_LIMIT_YEN = -30_000   # 月次DD上限(円)
+
+ENABLE_S4    = False  # 系統④ 有効/無効
+ENABLE_S5    = False  # 系統⑤ 有効/無効
 
 # ==========================================================================
 # ファイルパス
