@@ -283,6 +283,10 @@ def check_entry(now: datetime, board: dict) -> None:
         if zh_monitor.monthly_stopped:
             log(f"[系統{system}] 月次DD停止中 ({zh_monitor.monthly_pnl_yen:,.0f}円)")
             continue
+        # 物理金曜21:30バー: ①エントリーブロック（NFP等指標スパイクリスク）
+        if system == "①" and now.weekday() == 4 and 2125 <= hhmm_now < 2135:
+            log("[SKIP] fri_2130_entry_block(①)")
+            continue
         side = "long" if system == "①" else "short"
         _close_opposite(system, side, now, board)
         _enter_position(system, side, cp, board, now, sess_ex)
