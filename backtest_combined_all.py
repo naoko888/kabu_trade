@@ -13,7 +13,7 @@ import backtest_system45_combined  as bt45
 
 # ======================================================
 # 系統トグル
-USE_SYSTEM45 = True   # ④⑤ 逆張り系統（False = ①③ のみで集計）
+USE_SYSTEM45 = False  # ④⑤ 逆張り系統（False = ①③ のみで集計）
 USE_SYSTEM6  = False  # 前日終値乖離逆張り（THRESH=250 EV=+16.30pt PF=1.552）
 DD_6         = -15_000
 
@@ -262,7 +262,9 @@ def main():
     print(SEP80)
     print(f"  {'':10}  {'件数':>6}  {'勝率%':>6}  {'損益(pt)':>12}  {'損益(円)':>13}  {'期待値':>8}  {'PF':>7}")
     print("  " + SEP72)
-    sys_rows = [("系統①", t1), ("系統③", t3), ("系統④", t4), ("系統⑤", t5)]
+    sys_rows = [("系統①", t1), ("系統③", t3)]
+    if USE_SYSTEM45:
+        sys_rows += [("系統④", t4), ("系統⑤", t5)]
     if USE_SYSTEM6:
         sys_rows.append(("系統⑥", t6))
     sys_rows.append(("合算", all_trades))
@@ -276,7 +278,9 @@ def main():
     print(f"  {'':16}  {'件数':>6}  {'勝率%':>6}  {'損益(pt)':>12}  {'損益(円)':>13}  {'期待値':>8}  {'PF':>7}")
     print("  " + SEP72)
     for yr in sorted(all_trades["signal_year"].unique()):
-        yr_rows = [("系統①", t1), ("系統③", t3), ("系統④", t4), ("系統⑤", t5)]
+        yr_rows = [("系統①", t1), ("系統③", t3)]
+        if USE_SYSTEM45:
+            yr_rows += [("系統④", t4), ("系統⑤", t5)]
         if USE_SYSTEM6:
             yr_rows.append(("系統⑥", t6))
         yr_rows.append(("合算", all_trades))
@@ -324,7 +328,8 @@ def main():
     s6_tag = "+⑥" if USE_SYSTEM6 else ""
 
     # ── 合算DD版 ──
-    print(f"\n  【①③+④⑤{s6_tag} 月次累積損益（合算DD {DD_LIMIT:,}円適用後）】")
+    s45_tag = "+④⑤" if USE_SYSTEM45 else ""
+    print(f"\n  【①③{s45_tag}{s6_tag} 月次累積損益（合算DD {DD_LIMIT:,}円適用後）】")
     hdr3 = "  年  系統  " + "".join(f"  {m:>5}月" for m in months) + "     合計       PF     累積"
     print(hdr3)
     print("-" * len(hdr3))
@@ -336,8 +341,9 @@ def main():
 
     cumulative2 = 0
     for yr in sorted(a_comb["signal_year"].unique()):
-        rows2 = {"①③": ac13[ac13["signal_year"]==yr],
-                 "④⑤": ac45[ac45["signal_year"]==yr]}
+        rows2 = {"①③": ac13[ac13["signal_year"]==yr]}
+        if USE_SYSTEM45:
+            rows2["④⑤"] = ac45[ac45["signal_year"]==yr]
         if USE_SYSTEM6:
             rows2["⑥"] = ac6[ac6["signal_year"]==yr]
         rows2["合"] = a_comb[a_comb["signal_year"]==yr]
@@ -359,10 +365,10 @@ def main():
     print(f"\n{SEP80}")
     print(f"  4. 年別PF（合算DD {DD_LIMIT:,}円適用）")
     print(SEP80)
-    s6_hdr = f"  {'⑥N':>5} {'⑥PF':>6}" if USE_SYSTEM6 else ""
-    sep_w  = 103 if USE_SYSTEM6 else 90
-    print(f"\n  {'年':>6}  {'①N':>5} {'①PF':>6}  {'③N':>5} {'③PF':>6}  "
-          f"{'④N':>5} {'④PF':>6}  {'⑤N':>5} {'⑤PF':>6}{s6_hdr}  {'合N':>6} {'合PF':>7}  {'合損益(円)':>13}")
+    s45_hdr = f"  {'④N':>5} {'④PF':>6}  {'⑤N':>5} {'⑤PF':>6}" if USE_SYSTEM45 else ""
+    s6_hdr  = f"  {'⑥N':>5} {'⑥PF':>6}" if USE_SYSTEM6 else ""
+    sep_w   = 103 if USE_SYSTEM6 else (90 if USE_SYSTEM45 else 57)
+    print(f"\n  {'年':>6}  {'①N':>5} {'①PF':>6}  {'③N':>5} {'③PF':>6}{s45_hdr}{s6_hdr}  {'合N':>6} {'合PF':>7}  {'合損益(円)':>13}")
     print("  " + "-" * sep_w)
     for yr in sorted(active["signal_year"].unique()):
         r1 = calc_summary(a1[a1["signal_year"] == yr])
@@ -371,18 +377,18 @@ def main():
         r5 = calc_summary(a5[a5["signal_year"] == yr])
         r6 = calc_summary(a6[a6["signal_year"] == yr]) if USE_SYSTEM6 else None
         ra = calc_summary(active[active["signal_year"] == yr])
-        s6c = f"  {r6['n']:>5} {pf_s(r6['pf']):>6}" if USE_SYSTEM6 else ""
-        print(f"  {yr:>6}  {r1['n']:>5} {pf_s(r1['pf']):>6}  {r3['n']:>5} {pf_s(r3['pf']):>6}  "
-              f"{r4['n']:>5} {pf_s(r4['pf']):>6}  {r5['n']:>5} {pf_s(r5['pf']):>6}{s6c}  "
+        s45c = f"  {r4['n']:>5} {pf_s(r4['pf']):>6}  {r5['n']:>5} {pf_s(r5['pf']):>6}" if USE_SYSTEM45 else ""
+        s6c  = f"  {r6['n']:>5} {pf_s(r6['pf']):>6}" if USE_SYSTEM6 else ""
+        print(f"  {yr:>6}  {r1['n']:>5} {pf_s(r1['pf']):>6}  {r3['n']:>5} {pf_s(r3['pf']):>6}{s45c}{s6c}  "
               f"{ra['n']:>6} {pf_s(ra['pf']):>7}  {ra['pnl_yen']:>+13,}")
     print("  " + "-" * sep_w)
     r1a = calc_summary(a1); r3a = calc_summary(a3)
     r4a = calc_summary(a4); r5a = calc_summary(a5)
     r6a = calc_summary(a6) if USE_SYSTEM6 else None
     raa = calc_summary(active)
-    s6t = f"  {r6a['n']:>5} {pf_s(r6a['pf']):>6}" if USE_SYSTEM6 else ""
-    print(f"  {'全期間':>6}  {r1a['n']:>5} {pf_s(r1a['pf']):>6}  {r3a['n']:>5} {pf_s(r3a['pf']):>6}  "
-          f"{r4a['n']:>5} {pf_s(r4a['pf']):>6}  {r5a['n']:>5} {pf_s(r5a['pf']):>6}{s6t}  "
+    s45t = f"  {r4a['n']:>5} {pf_s(r4a['pf']):>6}  {r5a['n']:>5} {pf_s(r5a['pf']):>6}" if USE_SYSTEM45 else ""
+    s6t  = f"  {r6a['n']:>5} {pf_s(r6a['pf']):>6}" if USE_SYSTEM6 else ""
+    print(f"  {'全期間':>6}  {r1a['n']:>5} {pf_s(r1a['pf']):>6}  {r3a['n']:>5} {pf_s(r3a['pf']):>6}{s45t}{s6t}  "
           f"{raa['n']:>6} {pf_s(raa['pf']):>7}  {raa['pnl_yen']:>+13,}")
     print(f"  スキップ: {res_dd['skipped']}件  DD発動月: {res_dd['months_triggered']}ヶ月")
     if res_dd["triggered_yms"]:
@@ -390,7 +396,8 @@ def main():
 
     # ============================================================
     print(f"\n{SEP80}")
-    print(f"  5. 月次損失上限分析（系統①③④⑤{s6_tag} 合算）")
+    s45_tag2 = "④⑤" if USE_SYSTEM45 else ""
+    print(f"  5. 月次損失上限分析（系統①③{s45_tag2}{s6_tag} 合算）")
     print(SEP80)
     limits = [None, -20_000, -30_000, -40_000, -50_000, -60_000]
     print(f"\n  {'制限(円)':>12}  {'件数':>6}  {'スキップ':>8}  {'発動月':>6}  {'勝率%':>6}  {'損益(円)':>13}  {'PF':>7}")
@@ -415,7 +422,9 @@ def main():
     print(f"\n  系統別件数内訳（合算DD {DD_LIMIT:,}円適用後）")
     print(f"  {'系統':>6}  {'DD前':>6}  {'DD後':>6}  {'スキップ':>8}  {'勝率%':>6}  {'損益(円)':>13}  {'PF':>7}")
     print("  " + "-" * 62)
-    breakdown = [("①", t1, a1), ("③", t3, a3), ("④", t4, a4), ("⑤", t5, a5)]
+    breakdown = [("①", t1, a1), ("③", t3, a3)]
+    if USE_SYSTEM45:
+        breakdown += [("④", t4, a4), ("⑤", t5, a5)]
     if USE_SYSTEM6:
         breakdown.append(("⑥", t6, a6))
     breakdown.append(("合算", all_trades, active))
@@ -426,13 +435,13 @@ def main():
               f"{sa['win_rate']:>5.1f}%  {sa['pnl_yen']:>+13,}  {pf_s(sa['pf']):>7}")
 
     s6_dd_label = f" / ⑥: {DD_6:,}円" if USE_SYSTEM6 else ""
-    print(f"\n  系統別個別DD適用後の合算（①③: {DD_13:,}円 / ④⑤: {DD_45:,}円{s6_dd_label}）")
+    s45_dd_label = f" / ④⑤: {DD_45:,}円" if USE_SYSTEM45 else ""
+    print(f"\n  系統別個別DD適用後の合算（①③: {DD_13:,}円{s45_dd_label}{s6_dd_label}）")
     print(f"  {'系統':>8}  {'DD前':>6}  {'DD後':>6}  {'スキップ':>8}  {'勝率%':>6}  {'損益(円)':>13}  {'PF':>7}")
     print("  " + "-" * 66)
-    indiv_list = [
-        ("①③", t13_all, active13_i, res13_i),
-        ("④⑤", t45_all, active45_i, res45_i),
-    ]
+    indiv_list = [("①③", t13_all, active13_i, res13_i)]
+    if USE_SYSTEM45:
+        indiv_list.append(("④⑤", t45_all, active45_i, res45_i))
     if USE_SYSTEM6:
         indiv_list.append(("⑥",   t6,      active6_i,  res6_i))
     indiv_list.append(("合算", all_trades, active_indiv, None))
@@ -453,14 +462,16 @@ def main():
     print(SEP80)
     slips = [0, 2, 4, 6, 8, 10, 15, 20]
 
-    s6_mark = "⑥" if USE_SYSTEM6 else ""
-    indiv_lbl = f"①③{DD_13:,} / ④⑤{DD_45:,}" + (f" / ⑥{DD_6:,}" if USE_SYSTEM6 else "")
+    s6_mark   = "⑥" if USE_SYSTEM6 else ""
+    s45_mark  = "④⑤" if USE_SYSTEM45 else ""
+    indiv_lbl = f"①③{DD_13:,}" + (f" / ④⑤{DD_45:,}" if USE_SYSTEM45 else "") + (f" / ⑥{DD_6:,}" if USE_SYSTEM6 else "")
     slip_groups = [
-        (f"①③④⑤{s6_mark} 合算DD", active,       f"合算DD {DD_LIMIT:,}円"),
-        (f"①③④⑤{s6_mark} 個別DD", active_indiv, indiv_lbl),
-        ("①③",                     active13_i,   f"DD {DD_13:,}円"),
-        ("④⑤",                     active45_i,   f"DD {DD_45:,}円"),
+        (f"①③{s45_mark}{s6_mark} 合算DD", active,       f"合算DD {DD_LIMIT:,}円"),
+        (f"①③{s45_mark}{s6_mark} 個別DD", active_indiv, indiv_lbl),
+        ("①③",                             active13_i,   f"DD {DD_13:,}円"),
     ]
+    if USE_SYSTEM45:
+        slip_groups.append(("④⑤", active45_i, f"DD {DD_45:,}円"))
     if USE_SYSTEM6:
         slip_groups.append(("⑥", active6_i, f"DD {DD_6:,}円"))
     for grp_lbl, grp, dd_lbl in slip_groups:
@@ -476,7 +487,8 @@ def main():
 
     # ============================================================
     print(f"\n{SEP80}")
-    print("  7. 時間帯別EV分析（①③④⑤ 各系統・DD制限なし）")
+    s45_ev = "④⑤ " if USE_SYSTEM45 else ""
+    print(f"  7. 時間帯別EV分析（①③ {s45_ev}各系統・DD制限なし）")
     print("     ※ signal_hour = エントリー時の時刻（0〜23）")
     print("     ★ = EV負（除外候補）  ▲ = PF<1.1（弱い候補）")
     print(SEP80)
@@ -505,7 +517,10 @@ def main():
             print(f"  {hr:02d}h {flag}  {n:>5}  {wr:>5.1f}%  {ev:>+8.2f}  {pf_s(pf_v):>7}  {pnl_yen:>+12,}")
         print(f"  {'合計':>4}  {'':>5}  {'':>6}  {'':>8}  {'':>7}  {total_pnl:>+12,}")
 
-    for sys_lbl, sys_df in [("系統①", t1), ("系統③", t3), ("系統④", t4), ("系統⑤", t5)]:
+    ev_targets = [("系統①", t1), ("系統③", t3)]
+    if USE_SYSTEM45:
+        ev_targets += [("系統④", t4), ("系統⑤", t5)]
+    for sys_lbl, sys_df in ev_targets:
         hour_ev_table(sys_df, sys_lbl)
 
 
