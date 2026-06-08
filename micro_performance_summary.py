@@ -11,7 +11,6 @@ from pathlib import Path
 from datetime import timedelta
 
 import backtest_system123_combined as bt13
-import backtest_system45_combined  as bt45
 
 # ===== パス =====
 LIVE_LOG_FILE = Path(r"C:\kabu_trade\logs\micro_dry_log_all.csv")
@@ -42,27 +41,16 @@ BT13_KWARGS = dict(
     s3_weekdays_dst = (0, 2, 3, 4),
     s3_weekdays_win = (0, 2, 3, 4),
 )
-BT45_KWARGS = dict(
-    use_recovery = bt45.USE_RECOVERY,
-    use_vol      = bt45.USE_VOL,
-    use_rsi      = bt45.USE_RSI,
-    use_move     = bt45.USE_MOVE,
-)
-
-# TP/SL/side（表示用）
+# TP/SL/side（表示用）※ ④⑤は実運用停止中のため除外
 SYS_PARAMS = {
     "①": dict(tp=bt13.TP, sl=bt13.SL, side="long"),
     "③": dict(tp=bt13.TP, sl=bt13.SL, side="short"),
-    "④": dict(tp=bt45.LONG_PARAM["tp"],  sl=bt45.LONG_PARAM["sl"],  side="long"),
-    "⑤": dict(tp=bt45.SHORT_PARAM["tp"], sl=bt45.SHORT_PARAM["sl"], side="short"),
 }
 
 # 除外月（実運用のみ内訳用）
 SYS_EXCL_MONTHS = {
     "①": set(bt13.S1_EXCL_BASE),
     "③": set(bt13.S3_EXCL_MONTHS),
-    "④": set(bt45.S4_EXCL_MONTHS),
-    "⑤": set(bt45.S5_EXCL_MONTHS),
 }
 
 SEP = "=" * 80
@@ -168,7 +156,7 @@ def load_live_log() -> pd.DataFrame:
     df["pnl"]        = pd.to_numeric(df["pnl"], errors="coerce")
     df["entry_price"] = pd.to_numeric(df.get("entry_price", np.nan), errors="coerce") if "entry_price" in df.columns else np.nan
     df = df.dropna(subset=["entry_time", "pnl"]).copy()
-    df = df[df["system"].astype(str).isin(["①", "③", "④", "⑤"])].copy()
+    df = df[df["system"].astype(str).isin(["①", "③"])].copy()
     df["pnl_pt"]     = df["pnl"] - COMMISSION_PT
     df["pnl_yen"]    = (df["pnl_pt"] * PT_TO_YEN).round(0).astype(int)
     df["trade_date"] = df["entry_time"].apply(get_trade_date)
@@ -211,28 +199,17 @@ def _apply_dd(trades: pd.DataFrame) -> pd.DataFrame:
     return df[df["_keep"]].drop(columns=["_ym", "_keep"]).reset_index(drop=True)
 
 
-def run_bt(raw_bt13: pd.DataFrame, raw_bt45: pd.DataFrame, cpi_df: pd.DataFrame, label: str = "") -> pd.DataFrame:
-    """raw price df (bt13/bt45 別ソート) → ①③④⑤ BT 実行 + entry_info + DD 適用"""
-    if raw_bt13.empty and raw_bt45.empty:
+def run_bt(raw_bt13: pd.DataFrame, cpi_df: pd.DataFrame, label: str = "") -> pd.DataFrame:
+    """raw price df → ①③ BT 実行 + entry_info + DD 適用"""
+    if raw_bt13.empty:
         return pd.DataFrame()
     if label:
         print(f"  BT実行中 ({label})...")
-    # entry price 参照用: どちらも同じ行なので bt45 側（_tday 順）で OK
-    lookup_df = raw_bt45 if not raw_bt45.empty else raw_bt13
-    parts = []
-    if not raw_bt13.empty:
-        df13 = bt13.add_indicators(raw_bt13.copy())
-        t13  = bt13.run_backtest(df13, cpi_df, **BT13_KWARGS)
-        if not t13.empty:
-            parts.append(_add_entry_info(t13, lookup_df))
-    if not raw_bt45.empty:
-        df45 = bt45.add_indicators(raw_bt45.copy())
-        t45  = bt45.run_backtest(df45, cpi_df, **BT45_KWARGS)
-        if not t45.empty:
-            parts.append(_add_entry_info(t45, lookup_df))
-    if not parts:
+    df13 = bt13.add_indicators(raw_bt13.copy())
+    t13  = bt13.run_backtest(df13, cpi_df, **BT13_KWARGS)
+    if t13.empty:
         return pd.DataFrame()
-    combined = (pd.concat(parts, ignore_index=True)
+    combined = (_add_entry_info(t13, raw_bt13)
                 .sort_values("signal_dt")
                 .reset_index(drop=True))
     combined["pnl_yen"] = combined["pnl_yen"].astype(float).round(0).astype(int)
@@ -253,7 +230,7 @@ def print_bt_verification(bt_xlsx: pd.DataFrame):
     print(f"  {'系統':>4}  {'件数':>6}  {'勝率%':>6}  {'損益pt':>10}  {'損益(円)':>12}  {'EV(pt)':>8}  {'PF':>7}")
     print("  " + "-" * 65)
     total_n = total_yen = 0
-    for sys in ["①", "③", "④", "⑤"]:
+    for sys in ["①", "③"]:
         sub = bt_xlsx[bt_xlsx["system"] == sys]
         if sub.empty:
             continue
@@ -438,7 +415,7 @@ def print_pnl_summary(live_df: pd.DataFrame, bt_xlsx: pd.DataFrame, bt_csv: pd.D
 
     print(f"\n  系統別（実運用 5日）")
     live_5 = live_df[live_df["entry_time"] >= now - pd.Timedelta(days=5)] if not live_df.empty else pd.DataFrame()
-    for sys in ["①", "③", "④", "⑤"]:
+    for sys in ["①", "③"]:
         sub = live_5[live_5["system"] == sys] if not live_5.empty else pd.DataFrame()
         yen = int(sub["pnl_yen"].sum()) if not sub.empty else 0
         print(f"    {sys}:  {len(sub):>4}件  {yen:>+10,}")
@@ -490,17 +467,15 @@ def main():
         live_df = live_df[live_df["entry_time"] <= now].copy()
 
     print("XLSX データ読み込み中...")
-    raw_xlsx_bt13, raw_xlsx_bt45 = _load_raw_xlsx()
-    ref = raw_xlsx_bt45 if not raw_xlsx_bt45.empty else raw_xlsx_bt13
-    print(f"  {len(ref):,} 本  ({ref['datetime'].min()} ~ {ref['datetime'].max()})" if not ref.empty else "  データなし")
+    raw_xlsx_bt13, _ = _load_raw_xlsx()
+    print(f"  {len(raw_xlsx_bt13):,} 本  ({raw_xlsx_bt13['datetime'].min()} ~ {raw_xlsx_bt13['datetime'].max()})" if not raw_xlsx_bt13.empty else "  データなし")
 
     print("CSV データ読み込み中...")
-    raw_csv_bt13, raw_csv_bt45 = _load_raw_csv()
-    ref = raw_csv_bt45 if not raw_csv_bt45.empty else raw_csv_bt13
-    print(f"  {len(ref):,} 本  ({ref['datetime'].min()} ~ {ref['datetime'].max()})" if not ref.empty else "  データなし")
+    raw_csv_bt13, _ = _load_raw_csv()
+    print(f"  {len(raw_csv_bt13):,} 本  ({raw_csv_bt13['datetime'].min()} ~ {raw_csv_bt13['datetime'].max()})" if not raw_csv_bt13.empty else "  データなし")
 
-    bt_xlsx = run_bt(raw_xlsx_bt13, raw_xlsx_bt45, cpi_df, label="XLSX")
-    bt_csv  = run_bt(raw_csv_bt13,  raw_csv_bt45,  cpi_df, label="CSV")
+    bt_xlsx = run_bt(raw_xlsx_bt13, cpi_df, label="XLSX")
+    bt_csv  = run_bt(raw_csv_bt13,  cpi_df, label="CSV")
 
     # BT の未来シグナルを除外（trade_date で比較。entry_time は調整済みで物理時刻と異なる場合あり）
     today_td = get_trade_date(now)

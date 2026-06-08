@@ -112,10 +112,9 @@ def load_data() -> pd.DataFrame:
     if not dfs:
         raise FileNotFoundError("データファイルが見つかりません")
     df = pd.concat(dfs, ignore_index=True).drop_duplicates(subset=["datetime"]).copy()
-    df["_tday"] = df["datetime"].apply(
-        lambda dt: (dt - pd.Timedelta(days=1)).date() if dt.hour < 17 else dt.date()
-    )
-    df = df.sort_values(["_tday", "datetime"]).drop(columns=["_tday"]).reset_index(drop=True)
+    df["_tday"]     = df["datetime"].dt.date
+    df["_sort_grp"] = (df["datetime"].dt.hour < 17).astype(int)
+    df = df.sort_values(["_tday", "_sort_grp", "datetime"]).drop(columns=["_tday", "_sort_grp"]).reset_index(drop=True)
     print(f"合計: {len(df)} 本  ({df['datetime'].min()} ~ {df['datetime'].max()})\n")
     return df
 
@@ -296,14 +295,25 @@ def run_backtest(
 
 def _exec(arr_high, arr_low, arr_close, ep, entry_i, side, tp, sl, max_hold, n,
           arr_hm=None, arr_pwd=None):
+    GAP_BOUNDS = frozenset({1540, 555})
     for j in range(entry_i, min(entry_i + max_hold, n)):
+        if arr_hm is not None and arr_hm[j] in GAP_BOUNDS:
+            cl = arr_close[j]
+            pnl = float(cl - ep) if side == "long" else float(ep - cl)
+            return pnl, j, "TIME"
         hi = arr_high[j]; lo = arr_low[j]
         if side == "long":
-            if hi >= ep + tp: return tp,  j, "TP"
-            if lo <= ep - sl: return -sl, j, "SL"
+            tp_hit = hi >= ep + tp
+            sl_hit = lo <= ep - sl
+            if tp_hit and sl_hit: return -sl, j, "SL"
+            if tp_hit:            return  tp, j, "TP"
+            if sl_hit:            return -sl, j, "SL"
         else:
-            if lo <= ep - tp: return tp,  j, "TP"
-            if hi >= ep + sl: return -sl, j, "SL"
+            tp_hit = lo <= ep - tp
+            sl_hit = hi >= ep + sl
+            if tp_hit and sl_hit: return -sl, j, "SL"
+            if tp_hit:            return  tp, j, "TP"
+            if sl_hit:            return -sl, j, "SL"
         if arr_hm is not None and arr_pwd is not None:
             if arr_pwd[j] == 0 and arr_hm[j] == 600:
                 cl = arr_close[j]
