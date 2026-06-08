@@ -12,9 +12,10 @@ import backtest_system123_combined as bt13
 import backtest_system45_combined  as bt45
 
 # ======================================================
-# 系統⑥ トグル
-USE_SYSTEM6 = False  # 前日終値乖離逆張り（THRESH=250 EV=+16.30pt PF=1.552）
-DD_6        = -15_000
+# 系統トグル
+USE_SYSTEM45 = True   # ④⑤ 逆張り系統（False = ①③ のみで集計）
+USE_SYSTEM6  = False  # 前日終値乖離逆張り（THRESH=250 EV=+16.30pt PF=1.552）
+DD_6         = -15_000
 
 # 【系統④ 見直し履歴】
 # 更新日: 2026-05-21
@@ -167,7 +168,7 @@ def _add_exit_dt(trades: pd.DataFrame, df_price: pd.DataFrame) -> pd.DataFrame:
 
 def sim_monthly_dd(trades, dd_limit, use_exit_month=False):
     if len(trades) == 0:
-        return {"active": pd.DataFrame(), "skipped": 0, "months_triggered": 0}
+        return {"active": trades.iloc[0:0].copy(), "skipped": 0, "months_triggered": 0, "triggered_yms": []}
     # use_exit_month=True 時は決済順に処理（実運用に近い）
     sort_col = "exit_dt" if (use_exit_month and "exit_dt" in trades.columns) else "signal_dt"
     df = trades.sort_values(sort_col).copy()
@@ -205,16 +206,20 @@ def main():
     df13  = bt13.add_indicators(bt13.load_data())
     cpi13 = bt13.load_cpi()
 
-    print("\n【④⑤】データ読み込み中...")
-    df45  = bt45.add_indicators(bt45.load_data())
-    cpi45 = bt45.load_cpi()
+    if USE_SYSTEM45:
+        print("\n【④⑤】データ読み込み中...")
+        df45  = bt45.add_indicators(bt45.load_data())
+        cpi45 = bt45.load_cpi()
 
     # ── バックテスト実行 ──
     print("\n①③ バックテスト実行中...")
     trades13 = bt13.run_backtest(df13, cpi13, **BT13_KWARGS)
 
-    print("④⑤ バックテスト実行中...")
-    trades45 = bt45.run_backtest(df45, cpi45, **BT45_KWARGS)
+    if USE_SYSTEM45:
+        print("④⑤ バックテスト実行中...")
+        trades45 = bt45.run_backtest(df45, cpi45, **BT45_KWARGS)
+    else:
+        trades45 = pd.DataFrame(columns=["system","signal_dt","signal_year","signal_month","signal_weekday","pnl_pt","pnl_yen"])
 
     if USE_SYSTEM6:
         import backtest_system6b as bt6
@@ -228,8 +233,9 @@ def main():
     if USE_SETTLEMENT_MONTH:
         print("決済月算出中（①③）...")
         trades13 = _add_exit_dt(trades13, df13)
-        print("決済月算出中（④⑤）...")
-        trades45 = _add_exit_dt(trades45, df45)
+        if USE_SYSTEM45:
+            print("決済月算出中（④⑤）...")
+            trades45 = _add_exit_dt(trades45, df45)
 
     # ── 列を統一して結合 ──
     common = ["system", "signal_dt", "signal_year", "signal_month",
@@ -238,7 +244,7 @@ def main():
         common = common + ["exit_dt"]
     t13 = trades13[common].copy()
     t45 = trades45[common].copy()
-    parts = [t13, t45]
+    parts = [t13] + ([t45] if USE_SYSTEM45 else [])
     if USE_SYSTEM6:
         t6_raw = trades6[common].copy()
         parts.append(t6_raw)
@@ -510,5 +516,8 @@ if __name__ == "__main__":
         main()
     sys.stdout = sys.__stdout__
     print(f"出力完了: {out_path}")
-    import subprocess
-    subprocess.Popen(["code", out_path])
+    try:
+        import subprocess
+        subprocess.Popen(["code", out_path])
+    except FileNotFoundError:
+        pass
