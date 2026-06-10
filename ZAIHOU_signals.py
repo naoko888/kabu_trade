@@ -49,8 +49,8 @@ S1_MAX_HOLD    = 120    # bars
 # ==========================================================================
 S3_EXCL_MONTHS = frozenset((5, 7, 11))
 S3_WEEKDAYS    = frozenset((0, 2, 3, 4))     # 月水木金
-S3_HOURS_DST   = frozenset((0, 5, 8, 19, 20, 23))
-S3_HOURS_WIN   = frozenset((4, 5, 17, 18, 19, 20, 21))
+S3_HOURS_DST   = frozenset((0, 8, 19, 20, 23))
+S3_HOURS_WIN   = frozenset((4, 17, 18, 19, 20, 21))
 S3_TP          = 240
 S3_SL          = 60
 S3_MAX_HOLD    = 50     # bars
