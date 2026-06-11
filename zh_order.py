@@ -142,6 +142,39 @@ def send_tp_order(side: str, tp_price: float, session_exchange: int,
     return None
 
 
+def send_sl_order(side: str, sl_price: float, session_exchange: int) -> str | None:
+    """SL逆指値成行発注。side=エントリー方向("buy"|"sell")"""
+    if DRY_RUN:
+        return None
+    exit_side = "2" if side == "sell" else "1"  # 先物: 1=売 / 2=買
+    under_over = 1 if side == "buy" else 2       # buy=long→以下=1 / sell=short→以上=2
+    body = {
+        "Password": API_PASSWORD, "Symbol": zh_api.SYMBOL,
+        "Exchange": session_exchange,
+        "TradeType": 2,
+        "TimeInForce": 2,   # FAK必須（逆指値成行はFAS不可）
+        "Side": exit_side,
+        "Qty": LOT,
+        "Price": 0,         # 逆指値はPrice=0（価格はReverseLimitOrderに入れる）
+        "ExpireDay": 0,
+        "FrontOrderType": 30,
+        "ClosePositionOrder": 0,   # FIFO（Bug3回避）
+        "ReverseLimitOrder": {
+            "TriggerPrice": sl_price,
+            "UnderOver": under_over,
+            "AfterHitOrderType": 1,
+            "AfterHitPrice": 0,
+        }
+    }
+    res = zh_api.request_with_reauth("POST", "/sendorder/future", json_body=body)
+    if res:
+        oid = safe_json(res).get("OrderId", "")
+        log(f"[OK] SL逆指値発注 Price:{sl_price:.0f} OrderId:{oid}")
+        return oid
+    log(f"[ERR] SL発注失敗 Price:{sl_price:.0f}")
+    return None
+
+
 def cancel_order(order_id: str) -> bool:
     if not order_id:
         return False
