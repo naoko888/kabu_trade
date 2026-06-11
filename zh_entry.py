@@ -110,17 +110,22 @@ def _enter_position(system: str, side: str, cp: float, board: dict,
     hold_id = zh_order.get_hold_id(order_side, existing_ids)
     if not hold_id:
         log(f"[WARN] 系統{system} HoldID取得失敗 → ClosePositionOrder=0で代替")
-    # SLはソフトウェア価格監視のみ（ブローカーSL注文なし）
-    tp_oid = zh_order.send_tp_order(order_side, pos["tp_price"], session_exchange, hold_id)
-    pos["tp_order_id"] = tp_oid
+    # SLをブローカー逆指値成行で発注（D方式）
+    sl_oid = zh_order.send_sl_order(order_side, pos["sl_price"], session_exchange)
+    pos["sl_order_id"] = sl_oid
+    pos["tp_order_id"] = None   # D方式: TPはソフトウェア監視のため発注なし
     pos["order_id"]    = oid
     pos["hold_id"]     = hold_id
-    log(f"[ORDER] TP_OrderId:{tp_oid}  HoldID:{hold_id}")
+    log(f"[ORDER] SL_OrderId:{sl_oid}  HoldID:{hold_id}")
 
-    # TP受付確認
-    if tp_oid and zh_order.check_order_active(tp_oid) is False:
-        log(f"[WARN] 系統{system} TP注文非アクティブ確定 OrderId:{tp_oid}")
-        send_discord(f"⚠️ 系統{system} TP注文非アクティブ確定 OrderId:{tp_oid}")
+    # SL発注失敗 or 非アクティブ → 強制返済（無保護ポジションを持たない）
+    if not DRY_RUN and (not sl_oid or zh_order.check_order_active(sl_oid) is False):
+        log(f"[ERR] 系統{system} SL発注失敗 → 強制返済")
+        send_discord(f"🚨 系統{system} SL発注失敗 → 強制返済実行")
+        close_side = "sell" if order_side == "buy" else "buy"
+        close_oid = zh_order.send_entry_order(close_side, session_exchange, trade_type=2)
+        zh_order.wait_for_fill(close_oid)
+        return
 
     with zh_monitor._positions_lock:
         zh_monitor.positions.append(pos)

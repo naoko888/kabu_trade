@@ -108,8 +108,8 @@ def main():
         _h    = datetime.now(JST)
         _hhmm = _h.hour * 100 + _h.minute
         _se   = _sess_exchange(_hhmm)
-        log(f"[REPLACE] 起動時 SL/TP 再発注 Exchange={_se}")
-        zh_monitor.replace_close_orders(_se)
+        log(f"[RESTORE_SL] 起動時 SL復元 Exchange={_se}")
+        zh_monitor.restore_sl_orders(_se)
 
     last_micro_csv_min   = -1
     last_sl_replace_hhmm = -1   # 16:45 / 800 の重複防止

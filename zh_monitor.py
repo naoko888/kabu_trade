@@ -13,7 +13,7 @@ import ZAIHOU_signals as sig
 import zh_api
 import zh_order
 from zh_config import (
-    DRY_RUN, LOT, API_PASSWORD,
+    DRY_RUN,
     PT_TO_YEN, COMMISSION_YEN,
     OPEN_POS_FILE, LOG_DIR,
     DD_LIMIT_YEN, TICK_UNIT, JST,
@@ -229,110 +229,82 @@ def _monitor_inner(now: datetime, hhmm: int, board) -> None:
                     _sess = 23 if (1530 <= hhmm < 1700) else 24  # 暫定: 15:30基準
 
                 if reason == "TP到達":
-                    # GET /positions でポジションが消えているか確認
-                    hid = pos.get("hold_id")
-                    tp_confirmed = False
-                    res_pos = zh_api.request_with_reauth("GET", f"/positions?product=3&symbol={zh_api.SYMBOL}&addinfo=false")
+                    hid    = pos.get("hold_id")
+                    sl_oid = pos.get("sl_order_id")
+                    # SL約定済み確認（想定障害①: SLが先に発動していた場合）
+                    if _is_position_already_closed(hid, sl_oid):
+                        cp     = _get_sl_execution_price(sl_oid, pos["sl_price"])
+                        pnl    = (cp - pos["entry_price"]) if side == "long" else (pos["entry_price"] - cp)
+                        reason = "SL約定(TP検知後確認)"
+                        log(f"[TP] 系統{system} SL約定済み確認 → {cp:.0f}で記録")
+                    else:
+                        # SL未約定 → SLキャンセル → 成行TP決済（想定障害⑤）
+                        if sl_oid:
+                            zh_order.cancel_order(sl_oid)
+                            time.sleep(0.3)
+                            if zh_order.check_order_active(sl_oid) is True:
+                                log(f"[WAIT] 系統{system} SLキャンセル未確認 → 次ティック")
+                                still_open.append(pos)
+                                continue
+                        close_oid = zh_order.send_entry_order(close_side, _sess, trade_type=2)
+                        if close_oid == "DRY":
+                            cp  = pos["tp_price"]
+                            pnl = (cp - pos["entry_price"]) if side == "long" else (pos["entry_price"] - cp)
+                            log(f"[DRY] 系統{system} TP成行決済シミュレート:{cp:.0f}")
+                        elif close_oid:
+                            fill = zh_order.wait_for_fill(close_oid)
+                            if fill is not None:
+                                cp  = float(fill)
+                                pnl = (cp - pos["entry_price"]) if side == "long" else (pos["entry_price"] - cp)
+                                log(f"[LIVE] 系統{system} TP成行決済:{cp:.0f}")
+                            else:
+                                send_discord(f"🚨最緊急 系統{system} TP決済未確認 手動決済要")
+                                still_open.append(pos)
+                                continue
+                        else:
+                            send_discord(f"🚨最緊急 系統{system} TP決済失敗 手動決済要")
+                            still_open.append(pos)
+                            continue
+                elif reason == "SL到達":
+                    hid    = pos.get("hold_id")
+                    sl_oid = pos.get("sl_order_id")
+                    # ブローカーSL発動確認: /positions でポジション消滅確認
+                    res_pos = zh_api.request_with_reauth(
+                        "GET", f"/positions?product=3&symbol={zh_api.SYMBOL}&addinfo=false")
+                    pos_gone = False
                     if res_pos is not None:
                         pos_data = safe_json(res_pos)
                         if isinstance(pos_data, list):
                             if hid:
-                                tp_confirmed = not any(
+                                pos_gone = not any(
                                     str(p.get("ExecutionID")) == hid and float(p.get("LeavesQty", 0)) > 0
                                     for p in pos_data
                                 )
                             else:
                                 bside = "1" if side == "short" else "2"
-                                tp_confirmed = not any(
+                                pos_gone = not any(
                                     str(p.get("Side", "")) == bside and float(p.get("LeavesQty", 0)) > 0
                                     for p in pos_data
                                 )
-                    if not tp_confirmed:
-                        log(f"[WAIT] 系統{system} TP未約定(ポジション残存) → 次ティック再確認")
+                    if not pos_gone:
+                        log(f"[WAIT] 系統{system} SL未約定(ポジション残存) → 次ティック再確認")
                         still_open.append(pos)
                         continue
-                    cp  = pos["tp_price"]
+                    # SL約定確認 → 実約定価格取得（B案）
+                    cp  = _get_sl_execution_price(sl_oid, pos["sl_price"])
                     pnl = (cp - pos["entry_price"]) if side == "long" else (pos["entry_price"] - cp)
-                    log(f"[LIVE] 系統{system} TP約定確認(ポジション消滅):{cp:.0f}")
-                elif reason == "SL到達":
-                    # ソフトウェアSL: TP キャンセル → HoldQty==0 確認 → ClosePositions
-                    tp_oid     = pos.get("tp_order_id")
-                    hid        = pos.get("hold_id")
-                    _tp_closed = False
-
-                    # ─ アクション前ブローカー確認（マニュアル準拠）─
-                    if _is_position_already_closed(hid, tp_oid):
-                        cp         = pos["tp_price"]
-                        pnl        = (cp - pos["entry_price"]) if side == "long" else (pos["entry_price"] - cp)
-                        reason     = "TP約定(SL検知後確認)"
-                        _tp_closed = True
-                        log(f"[SL] 系統{system} TP約定済み確認 → {cp:.0f}で記録")
-
-                    if not _tp_closed:
-                        if tp_oid:
-                            zh_order.cancel_order(tp_oid)
-                        if tp_oid and hid:
-                            released = _wait_for_hold_release(hid)
-                            if released is None:
-                                cp         = pos["tp_price"]
-                                pnl        = (cp - pos["entry_price"]) if side == "long" else (pos["entry_price"] - cp)
-                                reason     = "TP約定(SL_POLL確認)"
-                                _tp_closed = True
-                                log(f"[SL_POLL] 系統{system} TP約定済み確認(安全網) → {cp:.0f}で記録")
-                            elif not released:
-                                send_discord(f"🚨最緊急 系統{system} SL HoldID解放タイムアウト 手動決済要")
-                                still_open.append(pos)
-                                continue
-
-                    if not _tp_closed:
-                        if hid:
-                            _body = {
-                                "Password": API_PASSWORD, "Symbol": zh_api.SYMBOL,
-                                "Exchange": _sess,
-                                "TradeType": 2, "TimeInForce": 2,
-                                "Side": "1" if close_side == "sell" else "2",
-                                "Qty": LOT, "Price": 0, "ExpireDay": 0,
-                                "FrontOrderType": 120,
-                                "ClosePositions": [{"HoldID": hid, "Qty": LOT}],
-                            }
-                            res_cl = zh_api.request_with_reauth("POST", "/sendorder/future", json_body=_body)
-                            rj = safe_json(res_cl) if res_cl else {}
-                            close_oid = rj.get("OrderId") if rj.get("Result") == 0 else None
-                            log(f"[SL_POLL] ClosePositions結果 Result:{rj.get('Result')} OrderId:{close_oid}")
-                        else:
-                            close_oid = zh_order.send_entry_order(close_side, _sess, trade_type=2)
-                        if close_oid and close_oid != "DRY":
-                            fill = zh_order.wait_for_fill(close_oid, max_retries=5, interval=1.0)
-                            if fill is not None:
-                                cp  = float(fill)
-                                pnl = (cp - pos["entry_price"]) if side == "long" else (pos["entry_price"] - cp)
-                                log(f"[LIVE] 系統{system} SL成行決済:{cp:.0f}")
-                            else:
-                                send_discord(f"🚨最緊急 系統{system} SL決済未確認 手動決済要")
-                                still_open.append(pos)
-                                continue
-                        else:
-                            send_discord(f"🚨最緊急 系統{system} SL決済失敗 手動決済要")
-                            still_open.append(pos)
-                            continue
-                    # TP は上記で cancel 実施済み（または _is_position_already_closed で検知）
+                    log(f"[LIVE] 系統{system} SL約定確認(ポジション消滅):{cp:.0f}")
                 else:
-                    # 強制決済: TPキャンセル → HoldQty解放確認 → HoldID名指し決済（SLと同方式）
-                    tp_ok = zh_order.cancel_order(pos["tp_order_id"]) if pos.get("tp_order_id") else True
-                    if not tp_ok:
-                        _emergency_flat(system, _sess)
-                        still_open.append(pos)
-                        continue
-                    hid = pos.get("hold_id")
-                    if pos.get("tp_order_id") and hid:
-                        if _wait_for_hold_release(hid) is False:
-                            msg = f"🚨最緊急 系統{system} 強制決済 HoldID解放タイムアウト 手動決済要"
-                            log(f"[ALERT] {msg}"); send_discord(msg)
-                            still_open.append(pos)
-                            continue
-                        # released is None → ポジション消滅 → 後続のポジション存在確認で処理
-                    # ポジション存在確認（SL/TPが先に約定済みの可能性を排除）
-                    res_pos = zh_api.request_with_reauth("GET", f"/positions?product=3&symbol={zh_api.SYMBOL}&addinfo=false")
+                    # 強制決済: SLキャンセル → ポジション確認 → FIFO成行決済（D方式）
+                    sl_oid = pos.get("sl_order_id")
+                    hid    = pos.get("hold_id")
+                    if sl_oid:
+                        zh_order.cancel_order(sl_oid)
+                        time.sleep(0.3)
+                    # ポジション存在確認（SLが先に約定済みの可能性を排除）
+                    already_closed = False
+                    res_pos = zh_api.request_with_reauth(
+                        "GET", f"/positions?product=3&symbol={zh_api.SYMBOL}&addinfo=false")
                     if res_pos is not None:
                         pos_data = safe_json(res_pos)
                         if isinstance(pos_data, list):
@@ -348,34 +320,31 @@ def _monitor_inner(now: datetime, hhmm: int, board) -> None:
                                     for p in pos_data
                                 )
                             if not still_exists:
-                                msg = f"⚠️ 系統{system} 強制決済スキップ(ポジションなし SL/TP約定済みの可能性)"
+                                cp     = _get_sl_execution_price(sl_oid, pos["sl_price"])
+                                pnl    = (cp - pos["entry_price"]) if side == "long" else (pos["entry_price"] - cp)
+                                reason = f"SL約定({reason}時確認)"
+                                msg    = f"⚠️ 系統{system} 強制決済スキップ(SL約定済み) @ {cp:.0f}"
                                 log(f"[WARN] {msg}"); send_discord(msg)
-                                continue
-                    if hid:
-                        _body = {
-                            "Password": API_PASSWORD, "Symbol": zh_api.SYMBOL,
-                            "Exchange": _sess,
-                            "TradeType": 2, "TimeInForce": 2,
-                            "Side": "1" if close_side == "sell" else "2",
-                            "Qty": LOT, "Price": 0, "ExpireDay": 0,
-                            "FrontOrderType": 120,
-                            "ClosePositions": [{"HoldID": hid, "Qty": LOT}],
-                        }
-                        res_cl = zh_api.request_with_reauth("POST", "/sendorder/future", json_body=_body)
-                        rj = safe_json(res_cl) if res_cl else {}
-                        close_oid = rj.get("OrderId") if rj.get("Result") == 0 else None
-                        log(f"[FORCE] ClosePositions Result:{rj.get('Result')} OrderId:{close_oid}")
-                    else:
+                                already_closed = True
+                    if not already_closed:
                         close_oid = zh_order.send_entry_order(close_side, _sess, trade_type=2)
-                    if close_oid and close_oid != "DRY":
-                        fill = zh_order.wait_for_fill(close_oid)
-                        if fill is None:
-                            msg = f"⚠️緊急 系統{system} {reason} 約定未確認 OrderId:{close_oid}"
-                            log(f"[ALERT] {msg}"); send_discord(msg)
+                        if close_oid == "DRY":
+                            cp  = pos["sl_price"]
+                            pnl = (cp - pos["entry_price"]) if side == "long" else (pos["entry_price"] - cp)
+                            log(f"[DRY] 系統{system} 強制決済シミュレート:{cp:.0f}")
+                        elif close_oid:
+                            fill = zh_order.wait_for_fill(close_oid)
+                            if fill is None:
+                                msg = f"⚠️緊急 系統{system} {reason} 約定未確認 OrderId:{close_oid}"
+                                log(f"[ALERT] {msg}"); send_discord(msg)
+                                still_open.append(pos)
+                                continue
+                            cp  = float(fill)
+                            pnl = (cp - pos["entry_price"]) if side == "long" else (pos["entry_price"] - cp)
+                        else:
+                            send_discord(f"🚨最緊急 系統{system} 強制決済失敗 手動決済要")
                             still_open.append(pos)
                             continue
-                        cp  = float(fill)
-                        pnl = (cp - pos["entry_price"]) if side == "long" else (pos["entry_price"] - cp)
 
             # ── 共通: ログ記録 ──
             day_pnl += pnl
@@ -480,6 +449,29 @@ def _is_position_already_closed(hid: str | None, order_id: str | None) -> bool:
     return False
 
 
+def _get_sl_execution_price(sl_oid: str | None, fallback: float) -> float:
+    """SL逆指値の実約定価格を /orders から取得。取得失敗時は fallback を返す"""
+    if not sl_oid:
+        log(f"[WARN] SL実価格取得失敗 sl_oid:None → fallback:{fallback:.0f}")
+        return fallback
+    res = zh_api.request_with_reauth("GET", f"/orders?product=3&id={sl_oid}")
+    if res is None:
+        log(f"[WARN] SL実価格取得失敗 sl_oid:{sl_oid} → fallback:{fallback:.0f}")
+        return fallback
+    orders = safe_json(res)
+    if not isinstance(orders, list) or not orders:
+        log(f"[WARN] SL実価格取得失敗 sl_oid:{sl_oid} → fallback:{fallback:.0f}")
+        return fallback
+    details = orders[0].get("Details") or []
+    fills = [d for d in details if d.get("RecType") == 8]
+    if fills:
+        p = float(fills[-1].get("Price") or 0)
+        if p > 0:
+            return p
+    log(f"[WARN] SL実価格取得失敗 sl_oid:{sl_oid} → fallback:{fallback:.0f}")
+    return fallback
+
+
 # ==========================================================================
 # 緊急フラット
 # ==========================================================================
@@ -509,30 +501,91 @@ def _emergency_flat(system: str, sess: int) -> None:
 # SL/TP再発注（セッション切替）/ ブローカー整合
 # ==========================================================================
 def replace_close_orders(session_exchange: int) -> None:
-    """セッション切替時にTP注文を新セッションで再発注（SLはソフトウェア監視のため不要）"""
+    """セッション切替時にSL注文を新セッションで再発注（TPはソフトウェア監視のため不要）"""
     if DRY_RUN:
         return
     with _positions_lock:
         log(f"[REPLACE] 対象: {len(positions)}件  Exchange={session_exchange}")
+        to_remove = []
         for pos in positions:
             order_side = "sell" if pos["side"] == "short" else "buy"
-            # TP 再発注（SLはソフトウェア監視のため再発注不要）
-            tp_oid = pos.get("tp_order_id")
-            if tp_oid:
-                zh_order.cancel_order(tp_oid)
+            sl_oid = pos.get("sl_order_id")
+            if sl_oid:
+                zh_order.cancel_order(sl_oid)  # FAK失効済みでも harmless
                 time.sleep(0.2)
-            new_tp = zh_order.send_tp_order(order_side, pos["tp_price"], session_exchange, pos.get("hold_id"))
-            pos["tp_order_id"] = new_tp
-            if new_tp:
-                tp_result = zh_order.check_order_active(new_tp)
-                if tp_result is not True:
-                    log(f"[WARN] 系統{pos['system']} REPLACE TP未確認"
-                        f"(result={tp_result}) OrderId:{new_tp}")
-                    send_discord(f"⚠️ 系統{pos['system']} REPLACE TP未確認"
-                                 f"(result={tp_result}) OrderId:{new_tp}")
-            log(f"  系統{pos['system']} {pos['side']}"
-                f"  SL:{pos['sl_price']:.0f}(ソフトウェア監視)"
-                f"  TP:{pos['tp_price']:.0f}(OrderId:{new_tp})")
+            new_sl = zh_order.send_sl_order(order_side, pos["sl_price"], session_exchange)
+            pos["sl_order_id"] = new_sl
+            if not new_sl or zh_order.check_order_active(new_sl) is not True:
+                msg = f"🚨 系統{pos['system']} REPLACE SL失敗({new_sl}) → 強制決済"
+                log(f"[ALERT] {msg}"); send_discord(msg)
+                close_side = "sell" if order_side == "buy" else "buy"
+                close_oid = zh_order.send_entry_order(close_side, session_exchange, trade_type=2)
+                if close_oid == "DRY":
+                    pass  # DRY_RUN guard があるので到達しないが念のため
+                elif close_oid:
+                    fill = zh_order.wait_for_fill(close_oid)
+                    if fill is None:
+                        msg = f"🚨最緊急 系統{pos['system']} 強制決済約定未確認 手動決済要"
+                        log(f"[ALERT] {msg}"); send_discord(msg)
+                        continue
+                else:
+                    msg = f"🚨最緊急 系統{pos['system']} 強制決済失敗 手動決済要"
+                    log(f"[ALERT] {msg}"); send_discord(msg)
+                    continue
+                to_remove.append(pos)
+            else:
+                log(f"  系統{pos['system']} {pos['side']}"
+                    f"  SL:{pos['sl_price']:.0f}(OrderId:{new_sl})"
+                    f"  TP:{pos['tp_price']:.0f}(ソフトウェア監視)")
+        for p in to_remove:
+            try:
+                positions.remove(p)
+            except ValueError:
+                pass
+        save_positions()
+
+
+def restore_sl_orders(session_exchange: int) -> None:
+    """再起動後のSL復元: 既存SLが有効なら保持、失効・未設定なら再発注（D方式専用）"""
+    if DRY_RUN:
+        return
+    with _positions_lock:
+        log(f"[RESTORE_SL] SL復元開始 {len(positions)}件")
+        to_remove = []
+        for pos in positions:
+            order_side = "sell" if pos["side"] == "short" else "buy"
+            sl_oid = pos.get("sl_order_id")
+            if sl_oid and zh_order.check_order_active(sl_oid) is True:
+                log(f"  系統{pos['system']} 既存SL有効 OrderId:{sl_oid}")
+                continue
+            log(f"  系統{pos['system']} SL{'失効' if sl_oid else 'なし'} → 再発注 Exchange:{session_exchange}")
+            new_sl = zh_order.send_sl_order(order_side, pos["sl_price"], session_exchange)
+            pos["sl_order_id"] = new_sl
+            if not new_sl or zh_order.check_order_active(new_sl) is not True:
+                msg = f"🚨 系統{pos['system']} SL復元失敗({new_sl}) → 強制決済"
+                log(f"[ALERT] {msg}"); send_discord(msg)
+                close_side = "sell" if order_side == "buy" else "buy"
+                close_oid = zh_order.send_entry_order(close_side, session_exchange, trade_type=2)
+                if close_oid == "DRY":
+                    pass  # DRY_RUN guard があるので到達しないが念のため
+                elif close_oid:
+                    fill = zh_order.wait_for_fill(close_oid)
+                    if fill is None:
+                        msg = f"🚨最緊急 系統{pos['system']} 強制決済約定未確認 手動決済要"
+                        log(f"[ALERT] {msg}"); send_discord(msg)
+                        continue
+                else:
+                    msg = f"🚨最緊急 系統{pos['system']} 強制決済失敗 手動決済要"
+                    log(f"[ALERT] {msg}"); send_discord(msg)
+                    continue
+                to_remove.append(pos)
+            else:
+                log(f"  系統{pos['system']} SL再発注成功 OrderId:{new_sl}")
+        for p in to_remove:
+            try:
+                positions.remove(p)
+            except ValueError:
+                pass
         save_positions()
 
 
